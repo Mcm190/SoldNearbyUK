@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SoldNearbyUK</string>
+    <string name="location_permission_rationale">SoldNearbyUK needs your location to show UK sold house prices near you.</string>
+    <string name="grant_permission">Grant location access</string>
+    <string name="attribution_text">Contains HM Land Registry Price Paid Data and ONS Postcode Directory data, © Crown copyright and database right, licensed under the Open Government Licence v3.0. Map data © OpenStreetMap contributors, © OpenMapTiles, tiles via OpenFreeMap.</string>
+    <string name="map_attribution_text">© OpenStreetMap · © OpenMapTiles</string>
+    <string name="source_land_registry_label">HM Land Registry — Price Paid Data (gov.uk)</string>
+    <string name="source_land_registry_url">https://www.gov.uk/government/collections/price-paid-data</string>
+    <string name="source_onspd_label">ONS — Postcode Directory (ons.gov.uk)</string>
+    <string name="source_onspd_url">https://www.ons.gov.uk/methodology/geography/geographicalproducts/postcodeproducts</string>
+    <string name="government_disclaimer">SoldNearbyUK is an independent app and is not affiliated with, endorsed by, or operated by HM Land Registry, the Office for National Statistics, or any UK government department or entity.</string>
+    <string name="locate_me">Locate me</string>
+    <string name="settings">Settings</string>
+    <string name="select_an_address">Select an address</string>
+    <string name="sale_history">Sale history</string>
+    <string name="no_previous_sales">No previous sales on record for this address.</string>
+</resources>

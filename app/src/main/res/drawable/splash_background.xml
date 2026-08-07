@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Stretched to fill (not tiled) — a plain @drawable/splash_image reference used directly as
+     a windowBackground risks tiling on some OS versions instead of scaling. -->
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/splash_image"
+    android:gravity="fill" />

@@ -1,0 +1,27 @@
+*.iml
+.claude/
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+.idea/
+*.apk
+*.aab
+
+# Large/regeneratable data artifacts — see tools/build_seed_data.py to rebuild
+tools/raw_data/
+tools/onspd_cache/
+
+# The bundled dataset itself — ~1.7GB, well over GitHub's 100MB push limit.
+# Regenerate with tools/build_seed_data.py, or get a build that has it via
+# the GitHub Release APK or Play Store — see README "Note on this repository".
+seed_data/src/main/assets/seed_prices.db
+seed_data/src/main/assets/seed_prices.version
+
+# Downloaded once, on demand, by tools/install_debug.sh
+tools/.bundletool-all.jar
+
+# Scratch workspace used to build sideloadable release APKs — not part of the project.
+/github/

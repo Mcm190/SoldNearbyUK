@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sampled from the corners of the logo artwork (light map-texture background) —
+         mostly hidden behind the full-bleed foreground image, only peeking through at
+         mask edges on launcher icon shapes that don't fully cover the square. -->
+    <color name="ic_launcher_background">#D4E6D7</color>
+</resources>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SoldNearby" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- Set as MainActivity's manifest theme so the custom splash artwork is the very first
+         thing drawn (as the window background, before any Kotlin/Compose code runs) — swapped
+         back to Theme.SoldNearby in MainActivity.onCreate() as soon as real content is ready.
+         Deliberately not the AndroidX SplashScreen API: that API only allows an icon on a
+         solid/gradient background by Android 12+ design policy, and can't show a fully custom
+         designed image like this one. -->
+    <style name="Theme.SoldNearby.Splash" parent="Theme.SoldNearby">
+        <item name="android:windowBackground">@drawable/splash_background</item>
+    </style>
+</resources>
