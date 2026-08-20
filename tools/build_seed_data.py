@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import sqlite3
 import sys
 import zipfile
@@ -194,19 +195,27 @@ def ingest_year(
     year: int,
     outcode: str | None,
     coords: dict[str, tuple[float, float]],
+    min_date: str | None = None,
+    max_date: str | None = None,
 ) -> tuple[int, int]:
     """Streams, geocodes, and writes one year's transactions, then commits.
 
     Never holds more than one batch of rows in memory — this is what lets a
     multi-decade pull run in bounded memory regardless of how many years
-    are requested.
+    are requested. min_date/max_date (inclusive, "YYYY-MM-DD") filter rows
+    by date_of_transfer so a rolling window can start/end mid-year without
+    needing to touch the CSV year boundaries themselves.
     """
     batch: list[tuple] = []
-    written = skipped = 0
+    written = skipped_geo = skipped_date = 0
     for record in stream_transactions(year, outcode):
+        transfer_date = record["date_of_transfer"][:10]
+        if (min_date and transfer_date < min_date) or (max_date and transfer_date > max_date):
+            skipped_date += 1
+            continue
         latlng = coords.get(record["postcode"].strip().upper())
         if latlng is None:
-            skipped += 1
+            skipped_geo += 1
             continue
         batch.append(to_row(record, latlng))
         if len(batch) >= INSERT_BATCH_SIZE:
@@ -217,8 +226,12 @@ def ingest_year(
         conn.executemany(INSERT_SQL, batch)
         written += len(batch)
     conn.commit()
-    print(f"  {year}: wrote {written:,} rows, skipped {skipped:,} (postcode not in ONSPD).", file=sys.stderr)
-    return written, skipped
+    print(
+        f"  {year}: wrote {written:,} rows, skipped {skipped_geo:,} (postcode not in ONSPD), "
+        f"{skipped_date:,} (outside date window).",
+        file=sys.stderr,
+    )
+    return written, skipped_geo
 
 
 def main() -> None:
@@ -230,6 +243,15 @@ def main() -> None:
     parser.add_argument(
         "--years", type=int, nargs="+", default=[2025],
         help="Price Paid Data year(s) to pull from (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--min-date", default=None,
+        help="Drop transactions before this date (inclusive), format YYYY-MM-DD. "
+             "Lets a rolling window start mid-year without excluding the whole year's CSV.",
+    )
+    parser.add_argument(
+        "--max-date", default=None,
+        help="Drop transactions after this date (inclusive), format YYYY-MM-DD.",
     )
     parser.add_argument("--output", default=None, help="Output .db path (default: seed_data/src/main/assets/seed_prices.db)")
     parser.add_argument(
@@ -255,7 +277,7 @@ def main() -> None:
     failed_years: list[int] = []
     for year in args.years:
         try:
-            written, skipped = ingest_year(conn, year, outcode, coords)
+            written, skipped = ingest_year(conn, year, outcode, coords, args.min_date, args.max_date)
             total_written += written
             total_skipped += skipped
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -283,8 +305,8 @@ def main() -> None:
 
     # A small sidecar the app reads to detect "the bundled asset changed" without having to
     # inspect the (possibly compressed, multi-GB) .db itself — see PriceDatabase.kt's open().
-    # Row count is enough: it changes for any different --years/--outcode selection, which is
-    # the only thing that ever changes what's in here.
+    # Row count is enough: it changes for any different --years/--outcode/--min-date/--max-date
+    # selection, which is the only thing that ever changes what's in here.
     version_path = output_path.with_suffix(".version")
     version_path.write_text(str(total_written))
 
