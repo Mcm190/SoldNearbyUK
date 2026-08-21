@@ -81,19 +81,36 @@ source ~/Android/env.sh
 ```
 
 Build and install onto a connected/USB-debugging-enabled device or running
-emulator:
+emulator. **Do not use `./gradlew installDebug` or `installRelease`** — since
+the dataset moved into the `:seed_data` install-time asset pack, both of those
+install only the base module, silently omitting the pack, and the app then
+crashes on launch at `context.assets.open("seed_prices.db")`. Go through the
+bundle instead:
 
 ```sh
 cd ~/Projects/HomeequiMap
-./gradlew installDebug
+./gradlew makeApkFromBundleForRelease
+java -jar bundletool-all.jar install-apks \
+  --apks=app/build/intermediates/apks_from_bundle/release/makeApkFromBundleForRelease/bundle.apks
 ```
 
-Or just build the APK and copy it over manually:
+Get `bundletool-all-<version>.jar` from
+[the bundletool releases page](https://github.com/google/bundletool/releases),
+matching the version AGP uses. The copy in `~/.gradle/caches/` is a plain
+library jar with no `Main-Class` and no bundled dependencies — `java -jar` on
+it fails.
+
+A correct install lists five entries, including `split_seed_data.apk`:
 
 ```sh
-./gradlew assembleDebug
-# → app/build/outputs/apk/debug/app-debug.apk (~760MB currently, signed with the debug key)
+adb shell pm path com.soldnearby.app
 ```
+
+If only `base.apk` comes back, the asset pack is missing and the app will crash.
+
+`./gradlew assembleDebug` still works for compiling, but the APK it produces
+(`app/build/outputs/apk/debug/app-debug.apk`, ~62MB) is base-module-only and is
+**not** runnable on its own for the same reason.
 
 To open and run it from Android Studio instead, just open this directory
 as a project — the Gradle wrapper (`./gradlew`) is already set up, so
@@ -121,12 +138,12 @@ python3 tools/build_seed_data.py                                    # all of Eng
 python3 tools/build_seed_data.py --years 2016 2017 2018 2019 2020 2021 2022 2023 2024 2025  # what's currently bundled: 10.08M rows, ~1.6GB raw / ~760MB APK
 python3 tools/build_seed_data.py --years 1995 1996 1997 1998 1999 2000 2001 2002 2003 2004 2005 2006 2007 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018 2019 2020 2021 2022 2023 2024 2025  # full history: 31.1M rows, ~3.5GB raw / ~1.9GB APK
 python3 tools/build_seed_data.py --outcode SW19                     # just one postcode area — fast, tiny file
-./gradlew installDebug                                               # rebuild the app with the new data
+./gradlew makeApkFromBundleForRelease                                # then install via bundletool — see Quick start
 ```
 
 Reseeding is safe to do even on a device/emulator that already has an
 older copy installed: the app compares a small `seed_prices.version`
-sidecar (row count) bundled next to the `.db` against a marker it wrote
+sidecar (`schema:rowcount`) bundled next to the `.db` against a marker it wrote
 on-device last time it copied the asset, and re-copies whenever they
 differ. Without that check, an install that already extracted an old
 copy into its own storage would keep using it forever, even after an
@@ -208,11 +225,12 @@ same `Context.getAssets()` the base module uses — that's what
 all for this move; it still just does `context.assets.open("seed_prices.db")`.
 
 This was verified by actually building device-specific split APKs from a
-real `.aab` via `bundletool` (`build-apks` + `install-apks`, not the
-Gradle `installDebug` shortcut, which bypasses real bundle-splitting) and
-confirming `split_seed_data.apk` installs as its own split alongside
-`base.apk`, with the base module's own uncompressed size around 79MB —
-comfortably under the 200MB cap.
+real `.aab` via `bundletool` (`build-apks` + `install-apks`) and confirming
+`split_seed_data.apk` installs as its own split alongside `base.apk`, with
+the base module's own uncompressed size around 79MB — comfortably under the
+200MB cap. That is also the only install route that produces a *runnable*
+app: the Gradle `installDebug`/`installRelease` shortcuts don't just bypass
+real bundle-splitting, they omit the asset pack entirely (see Quick start).
 
 Practically, this is transparent: `tools/build_seed_data.py` and
 `tools/update_seed_data.py` write straight to
@@ -351,7 +369,7 @@ recoverable through Play Console's key-reset process rather than fatal.
   outright by the OS for the memory pressure it caused, or, if that kill
   landed mid-transaction, left the on-device copy with a stale journal
   that threw `SQLiteDatabaseLockedException` on the next launch. `open()`
-  also compares a `seed_prices.version` sidecar (row count) against a
+  also compares a `seed_prices.version` sidecar (`schema:rowcount`) against a
   marker it wrote last time it copied the asset, and re-copies whenever
   they differ — otherwise reseeding would silently do nothing for any
   install that already extracted an older copy into its own storage.
@@ -363,13 +381,17 @@ recoverable through Play Console's key-reset process rather than fatal.
   for one exact (postcode, address) pair, newest first, regardless of the
   recency filter (history is specifically about the past); it relies on
   the pre-built `idx_sold_properties_address` index — the alternative was
-  a full scan of the whole table on every tap. `averagePriceBySector`
+  a full scan of the whole table on every tap. `sectorsWithinBounds`
   backs the recent-sales heatmap via `PropertyRepository.salesDensityBySector`
-  (which weights by sale count, not price): postcodes are always
-  "outcode, space, one digit, two letters", so `substr(postcode, 1,
-  length(postcode) - 2)` gives the sector regardless of the outcode's own
-  variable length, and the existing `(latitude, longitude)` index still
-  narrows the `WHERE` clause before SQLite groups the results.
+  (which weights by sale count, not price). It isn't a query: the
+  per-sector rollup is precomputed into a `sector_stats` table by
+  `build_seed_data.py` and read into memory once, because nothing about
+  it varies at runtime — the 2-year window is fixed and deliberately
+  ignores the "recent sales only" toggle. Deriving it live instead, as a
+  `GROUP BY` over the viewport, cost up to ~18s per camera-idle event
+  when zoomed out, and blocked every other query behind it (the file is
+  opened read-only and non-WAL, so Android caps its connection pool at
+  one). The whole table is ~8k rows regardless of dataset size.
   `data/PropertyRepository.kt` is the seam to swap for a network-backed
   implementation later; the UI only depends on its shape.
   `data/AppSettings.kt` + `SettingsRepository` persist the recency-filter

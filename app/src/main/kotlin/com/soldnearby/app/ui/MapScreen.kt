@@ -58,6 +58,8 @@ import com.soldnearby.app.util.createDotIcon
 import com.soldnearby.app.util.formatGbp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.maplibre.android.annotations.MarkerOptions
@@ -75,6 +77,7 @@ import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.Point
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Used only until we have a real location fix (or if permission is denied). */
 private val LONDON_FALLBACK = LatLng(51.5074, -0.1278)
@@ -95,22 +98,29 @@ private const val UK_MIN_ZOOM = 4.5
  *  real map apps hide or cluster POI-level markers at low zoom for the same reason. */
 private const val MIN_ZOOM_FOR_DOTS = 12.5
 
-/** Below this, a viewport's bounds are wide enough to sweep in a large fraction of the whole
- *  bundled dataset (regional/national scale), which turns the sector GROUP BY behind the
- *  heatmap into a scan of millions of rows on every camera-idle event — that's what made the
- *  rest of the app janky when zoomed out too far. The heatmap still gets to work at a much
- *  more zoomed-out level than the dots (MIN_ZOOM_FOR_DOTS), just not "most of the country" far. */
-private const val MIN_ZOOM_FOR_HEATMAP = 7.0
-
 /** Expands the query past exactly what's visible so panning slightly doesn't show an empty
  *  edge before the next reload catches up. */
 private const val BOUNDS_BUFFER_FACTOR = 0.25
+
+/** How long a refresh waits before it actually starts work. A pan or a pinch-zoom doesn't fire
+ *  one camera-idle event, it fires a burst of them, and each one cancels and replaces the last
+ *  (see triggerRefresh) — so without this, a single gesture put a dozen queries into
+ *  PropertyRepository's one-at-a-time queue, every one of them already obsolete by the time it
+ *  reached the front. Short enough to be imperceptible once the map settles, long enough that a
+ *  gesture costs one query instead of a dozen. */
+private const val REFRESH_DEBOUNCE_MS = 250L
 
 private const val HEATMAP_SOURCE_ID = "sector-density-heatmap-source"
 private const val HEATMAP_LAYER_ID = "sector-density-heatmap-layer"
 private const val MY_LOCATION_SOURCE_ID = "my-location-source"
 private const val MY_LOCATION_LAYER_ID = "my-location-layer"
 private const val MY_LOCATION_IMAGE_ID = "my-location-icon"
+
+/** How often the "you are here" dot re-fetches a fix and moves to follow the user. Only the
+ *  dot follows on this cadence — the camera never does, so panning/zooming around the map
+ *  stays completely free; it only snaps to the latest fix when the locate-me button is
+ *  pressed (see centerOnCurrentLocation). */
+private const val MY_LOCATION_POLL_INTERVAL_MS = 1500L
 
 @Composable
 fun MapScreen(
@@ -119,6 +129,7 @@ fun MapScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
     // Follows this app's own "Dark mode" setting, not the system theme (see SoldNearbyTheme) —
     // the map tiles should match the rest of the UI rather than the device default.
     val isDarkTheme = settings.darkModeEnabled
@@ -192,6 +203,14 @@ fun MapScreen(
     // one's DB query run to completion would mean multiple queries racing to redraw the map with
     // whichever happens to finish last, not the one for where the camera actually ended up.
     var refreshJob by remember { mutableStateOf<Job?>(null) }
+    // Incremented by triggerRefresh on every launch, and captured by the coroutine it launches,
+    // so a refresh can tell whether it's still the current one when it finishes — see
+    // triggerRefresh for what that's for. A plain counter rather than Compose state on purpose:
+    // nothing should recompose because a refresh started.
+    val refreshGeneration = remember { AtomicInteger(0) }
+    // Reused for every fix — both the one-shot pulls (initial centre, locate-me button) and the
+    // background poll below — rather than a fresh FusedLocationProviderClient per call.
+    val locationTracker = remember(context) { LocationTracker(context) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -211,21 +230,30 @@ fun MapScreen(
     // to whatever's currently loaded — the low/high end of the scale is always "quietest/busiest
     // sector on screen right now", not a fixed nationwide scale, so it stays meaningful whether
     // you're looking at central London or a small town, and updates as you pan elsewhere.
-    fun updateHeatmapSource(sectors: List<PostcodeSectorPrice>) {
-        val source = heatmapSource ?: return
+    // Building the FeatureCollection is done off the main thread (setGeoJson itself still has to
+    // happen on it): zoomed all the way out this is every sector in the country — ~8k points to
+    // allocate and serialise — which is enough to drop frames if it runs on the UI thread.
+    suspend fun updateHeatmapSource(sectors: List<PostcodeSectorPrice>) {
         if (sectors.isEmpty()) {
-            source.setGeoJson(FeatureCollection.fromFeatures(emptyArray()))
+            heatmapSource?.setGeoJson(FeatureCollection.fromFeatures(emptyArray()))
             return
         }
-        val counts = sectors.map { it.saleCount }
-        val minCount = counts.min()
-        val range = (counts.max() - minCount).let { if (it <= 0) 1 else it }
-        val features = sectors.map { sector ->
-            val weight = ((sector.saleCount - minCount).toDouble() / range).coerceIn(0.0, 1.0)
-            val properties = JsonObject().apply { addProperty("weight", weight) }
-            Feature.fromGeometry(Point.fromLngLat(sector.longitude, sector.latitude), properties)
+        val collection = withContext(Dispatchers.Default) {
+            val counts = sectors.map { it.saleCount }
+            val minCount = counts.min()
+            val range = (counts.max() - minCount).let { if (it <= 0) 1 else it }
+            val features = sectors.map { sector ->
+                val weight = ((sector.saleCount - minCount).toDouble() / range).coerceIn(0.0, 1.0)
+                val properties = JsonObject().apply { addProperty("weight", weight) }
+                Feature.fromGeometry(Point.fromLngLat(sector.longitude, sector.latitude), properties)
+            }
+            FeatureCollection.fromFeatures(features)
         }
-        source.setGeoJson(FeatureCollection.fromFeatures(features))
+        // Deliberately read after the suspension above, not before it: a dark-mode toggle
+        // replaces the whole Style mid-refresh, and the GeoJsonSource this held a moment ago
+        // would by then be orphaned from a destroyed style. onStyleLoaded repopulates the fresh
+        // one itself, so dropping this update is the correct outcome, not a lost frame.
+        heatmapSource?.setGeoJson(collection)
     }
 
     // Empty position clears the pin (permission denied, or a fix that never resolved) rather
@@ -240,6 +268,8 @@ fun MapScreen(
         }
     }
 
+    // Never sets isLoading back to false itself — triggerRefresh owns clearing it, including on
+    // the paths through here that don't finish (see its comment).
     suspend fun refreshVisibleProperties() {
         val currentMap = map ?: return
         val repo = repository ?: return
@@ -253,15 +283,14 @@ fun MapScreen(
         val minLng = bounds.longitudeWest - lngBuffer
         val maxLng = bounds.longitudeEast + lngBuffer
 
-        // Sector averages are cheap to compute at city/regional scale (SQL GROUP BY, not a
-        // per-row fetch), so unlike the dots below, the heatmap is updated before that gate
-        // rather than after it — but it still needs its own, much more permissive floor
-        // (MIN_ZOOM_FOR_HEATMAP): once the viewport is wide enough to sweep in a large chunk
-        // of the whole bundled dataset, that same GROUP BY turns into a multi-million-row scan
-        // on every camera-idle event, which is what made the rest of the app janky when
-        // zoomed out too far.
+        // Updated before the zoom gate below rather than after it: unlike the dots, a density
+        // surface is *most* useful zoomed out, and it now costs effectively nothing at any zoom
+        // — it's an in-memory filter over a precomputed table (see
+        // PropertyRepository.salesDensityBySector), not the viewport-wide GROUP BY it used to
+        // be. That query is why this used to need a zoom floor of its own; without it there's
+        // nothing left to gate on.
         updateHeatmapSource(
-            if (currentSettings.heatmapEnabled && zoom >= MIN_ZOOM_FOR_HEATMAP) {
+            if (currentSettings.heatmapEnabled) {
                 repo.salesDensityBySector(minLat, maxLat, minLng, maxLng)
             } else {
                 emptyList()
@@ -275,7 +304,6 @@ fun MapScreen(
             nearbyProperties = emptyList()
             isZoomedOutTooFar = true
             hasLoadedOnce = true
-            isLoading = false
             return
         }
         isZoomedOutTooFar = false
@@ -332,7 +360,6 @@ fun MapScreen(
             }
         }
         nearbyProperties = properties
-        isLoading = false
         hasLoadedOnce = true
     }
 
@@ -341,20 +368,37 @@ fun MapScreen(
     // Cancelling whatever refresh is still in flight before starting the next one matters
     // because refreshVisibleProperties does several unrelated things (heatmap, dots, loading
     // state) that each get applied as soon as their own query returns, not atomically as a
-    // whole — without a single shared job to cancel, a slow call (e.g. the heatmap query at a
-    // zoom level near MIN_ZOOM_FOR_HEATMAP) that was reading "heatmap on" moments ago could
-    // still finish and repaint the heatmap *after* a newer, faster call already cleared it for
-    // "heatmap off", silently reverting the toggle the user just made.
+    // whole — without a single shared job to cancel, a slow call that was reading "heatmap on"
+    // moments ago could still finish and repaint the heatmap *after* a newer, faster call
+    // already cleared it for "heatmap off", silently reverting the toggle the user just made.
+    // Also the single owner of isLoading, in a try/finally, because refreshVisibleProperties has
+    // no way to clear it on the path that actually matters: cancellation. A cancelled coroutine
+    // throws at its next suspension point and never reaches the end of the function, so with the
+    // flag cleared inline the spinner's lifetime was really "until the *newest* refresh
+    // finishes" — with no timeout and no fallback if that one never did. That's what turned a
+    // slow query into an indefinite spinner rather than a slow load. Guarded on the generation
+    // so a cancelled refresh can't clear a spinner that now belongs to the one that replaced it;
+    // the counter is incremented before the cancel so the outgoing job's finally is already
+    // stale by the time it runs.
     fun triggerRefresh() {
+        val generation = refreshGeneration.incrementAndGet()
         refreshJob?.cancel()
-        refreshJob = scope.launch { refreshVisibleProperties() }
+        refreshJob = scope.launch {
+            try {
+                delay(REFRESH_DEBOUNCE_MS)
+                refreshVisibleProperties()
+            } finally {
+                if (generation == refreshGeneration.get()) isLoading = false
+            }
+        }
     }
 
     suspend fun centerOnCurrentLocation() {
         val currentMap = map ?: return
         hasRequestedInitialCenter = true
         val gpsFix = if (hasLocationPermission) {
-            LocationTracker(context).currentLocation()?.let { (lat, lng) -> LatLng(lat, lng) }
+            runCatching { locationTracker.currentLocation() }.getOrNull()
+                ?.let { (lat, lng) -> LatLng(lat, lng) }
         } else {
             null
         }
@@ -393,6 +437,28 @@ fun MapScreen(
 
     LaunchedEffect(map, hasLocationPermission) {
         centerOnCurrentLocation()
+    }
+
+    // Keeps the "you are here" dot following the user as they actually move, instead of the
+    // one-shot fix above going stale the moment they walk/drive away from where the app was
+    // opened. Deliberately only ever touches the dot (updateMyLocationSource), never the
+    // camera — free panning/zooming stays free, and the map only snaps to the latest fix when
+    // the locate-me button calls centerOnCurrentLocation() directly.
+    LaunchedEffect(map, hasLocationPermission) {
+        if (map == null || !hasLocationPermission) return@LaunchedEffect
+        while (isActive) {
+            delay(MY_LOCATION_POLL_INTERVAL_MS)
+            // Skips the fetch (rather than just skipping the camera/UI update) while the app is
+            // backgrounded — below STARTED means onStop has already fired, so there's no visible
+            // dot to update anyway, and there's no reason to keep pinging GPS for a screen no
+            // one can see.
+            if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) continue
+            val gpsFix = runCatching { locationTracker.currentLocation() }.getOrNull()
+                ?.let { (lat, lng) -> LatLng(lat, lng) }
+            if (gpsFix != null) {
+                updateMyLocationSource(gpsFix)
+            }
+        }
     }
 
     // A settings change (recency filter, heatmap toggle) should reload the current view in
@@ -546,7 +612,14 @@ fun MapScreen(
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(8.dp),
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
+            // contentColor is set explicitly here (and everywhere else in this file that uses
+            // a Surface with an alpha-adjusted color) because Material3's Surface only infers a
+            // readable content color when its `color` is *exactly* one of the ColorScheme's
+            // known colors — `.copy(alpha = ...)` breaks that equality check, silently falling
+            // back to whatever content color was already ambient (unreadable black text on a
+            // dark surface in dark mode) instead of colorScheme.onSurface.
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+            contentColor = MaterialTheme.colorScheme.onSurface
         ) {
             Text(
                 text = stringResource(R.string.map_attribution_text),
@@ -637,7 +710,8 @@ fun MapScreen(
             Surface(
                 modifier = Modifier.align(Alignment.Center).padding(24.dp),
                 shape = RoundedCornerShape(12.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                contentColor = MaterialTheme.colorScheme.onSurface
             ) {
                 Column(
                     modifier = Modifier.padding(20.dp),
@@ -659,7 +733,8 @@ fun MapScreen(
             if (isZoomedOutTooFar) {
                 Surface(
                     modifier = Modifier.align(Alignment.Center).padding(24.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                    contentColor = MaterialTheme.colorScheme.onSurface
                 ) {
                     Text(
                         text = "Zoom in to see sold prices",
@@ -670,7 +745,8 @@ fun MapScreen(
             } else if (nearbyProperties.isEmpty()) {
                 Surface(
                     modifier = Modifier.align(Alignment.Center).padding(24.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                    contentColor = MaterialTheme.colorScheme.onSurface
                 ) {
                     val recencyNote = if (settings.recentOnly) " in the last 12 months" else ""
                     Text(

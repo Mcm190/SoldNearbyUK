@@ -62,6 +62,20 @@ ONSPD_URL = "https://www.arcgis.com/sharing/rest/content/items/6fff67d204fd4f339
 USER_AGENT = "SoldNearby/0.1 (dev build; https://github.com/)"
 INSERT_BATCH_SIZE = 50_000
 
+# Bumped whenever the *shape* of the database changes (a new table, a new column, a new index) —
+# as opposed to just its contents. The .version sidecar the app compares against is otherwise
+# derived purely from the row count, which doesn't move when a schema change leaves the same
+# transactions in place; an install that already had a copy would then keep using its old,
+# structurally-outdated one and blow up on the first query that touches whatever was added.
+# See PriceDatabase.open().
+SEED_SCHEMA_VERSION = 2
+
+# How far back sector_stats aggregates, in years. Anchored to the newest sale actually in the
+# dataset rather than to today's date, for the same reason PropertyRepository is: the bundled
+# data doesn't necessarily reach up to today, so a "today minus 2 years" cutoff could exclude
+# everything. Kept in step with the window PropertyRepository.salesDensityBySector documents.
+SECTOR_STATS_YEARS = 2
+
 INSERT_SQL = """
     INSERT INTO sold_properties
         (address, postcode, price_gbp, date_of_transfer, property_type, new_build, tenure, latitude, longitude)
@@ -190,6 +204,67 @@ def create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def build_sector_stats(conn: sqlite3.Connection) -> int:
+    """Precomputes the per-postcode-sector rollup behind the app's heatmap.
+
+    The app used to derive this live, running the GROUP BY below over whatever was in the
+    viewport on every single camera-idle event. That's fine at street level, but the cost
+    scales with the area on screen rather than with the number of sectors returned, and
+    zoomed out it became a scan of a large fraction of the whole table: measured against a
+    9.7M-row build, ~1.6s for Greater London, 4.3s for the south east, and 18.1s for a view
+    covering most of England — on a desktop SSD with a warm cache, so substantially worse on
+    a phone. Since the app opens this file read-only and non-WAL, Android gives it a
+    connection pool of exactly one, so each of those scans also blocked every other query
+    behind it; a zoomed-out pan could leave the map showing a spinner long after the user had
+    stopped moving and zoomed back in.
+
+    Nothing about the result actually varies at runtime — the window is fixed, it ignores the
+    app's "recent sales only" setting by design, and the app weights purely on sale_count — so
+    the entire query exists to re-derive constants. Precomputing it collapses the whole thing
+    to ~8k rows (a few hundred KB), small enough that the app loads the table into memory once
+    and filters it there, never touching SQLite for the heatmap again at any zoom level.
+
+    One deliberate behaviour change: a sector's count is now its true total, whereas the live
+    query only counted the rows inside the viewport, so a sector straddling the edge of the
+    screen used to report a partial count and a centroid dragged toward the visible part —
+    both of which shifted as you panned.
+    """
+    max_date = conn.execute("SELECT MAX(date_of_transfer) FROM sold_properties").fetchone()[0]
+    cutoff = datetime.date.fromisoformat(max_date).replace(
+        year=datetime.date.fromisoformat(max_date).year - SECTOR_STATS_YEARS
+    ).isoformat()
+
+    conn.execute(
+        """
+        CREATE TABLE sector_stats (
+            sector TEXT PRIMARY KEY,
+            sale_count INTEGER NOT NULL,
+            average_price_gbp REAL NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL
+        )
+        """
+    )
+    # A full postcode is always "outcode, space, one digit, two letters" (e.g. "SW1A 1AA"), so
+    # dropping the last two characters gives the sector regardless of the outcode's own variable
+    # length ("SW1A 1AA" -> "SW1A 1", "OX4 1AB" -> "OX4 1").
+    conn.execute(
+        """
+        INSERT INTO sector_stats (sector, sale_count, average_price_gbp, latitude, longitude)
+        SELECT substr(postcode, 1, length(postcode) - 2) AS sector,
+               COUNT(*), AVG(price_gbp), AVG(latitude), AVG(longitude)
+        FROM sold_properties
+        WHERE date_of_transfer >= ?
+        GROUP BY sector
+        """,
+        (cutoff,),
+    )
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM sector_stats").fetchone()[0]
+    print(f"  {count:,} sectors, aggregated over sales since {cutoff}.", file=sys.stderr)
+    return count
+
+
 def ingest_year(
     conn: sqlite3.Connection,
     year: int,
@@ -301,14 +376,18 @@ def main() -> None:
     print("Building address index...", file=sys.stderr)
     conn.execute("CREATE INDEX idx_sold_properties_address ON sold_properties (postcode, address)")
     conn.commit()
+
+    print("Building postcode-sector rollup...", file=sys.stderr)
+    build_sector_stats(conn)
     conn.close()
 
     # A small sidecar the app reads to detect "the bundled asset changed" without having to
     # inspect the (possibly compressed, multi-GB) .db itself — see PriceDatabase.kt's open().
-    # Row count is enough: it changes for any different --years/--outcode/--min-date/--max-date
-    # selection, which is the only thing that ever changes what's in here.
+    # Row count covers content: it changes for any different --years/--outcode/--min-date/
+    # --max-date selection. SEED_SCHEMA_VERSION covers the cases row count can't see — a build
+    # that adds a table or an index without changing which transactions are in the file.
     version_path = output_path.with_suffix(".version")
-    version_path.write_text(str(total_written))
+    version_path.write_text(f"{SEED_SCHEMA_VERSION}:{total_written}")
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"\nWrote {total_written:,} geocoded rows to {output_path} ({size_mb:.1f} MB).", file=sys.stderr)

@@ -137,39 +137,41 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
     }
 
     /**
-     * Average price and sale count per postcode sector within bounds — the data behind the
-     * recent-sales heatmap (which weights by sale count, not price; see
-     * PropertyRepository.salesDensityBySector). A full postcode is always "outcode, space, one
-     * digit, two letters" (e.g. "SW1A 1AA"), so
-     * dropping the last two characters gives the sector regardless of the outcode's own
-     * variable length ("SW1A 1AA" -> "SW1A 1", "OX4 1AB" -> "OX4 1"). Aggregated in SQL rather
-     * than pulled row-by-row into Kotlin: GROUP BY collapses what could be thousands of rows
-     * per sector down to one, and the existing (latitude, longitude) index still narrows the
-     * WHERE clause before that grouping happens. No LIMIT — a bounded viewport only ever
-     * contains a small number of distinct sectors, unlike raw per-address rows.
+     * Every postcode sector's precomputed 2-year rollup — the data behind the recent-sales
+     * heatmap (which weights by sale count, not price; see PropertyRepository). Read once and
+     * held in memory: the whole sector_stats table is ~8k rows / a few hundred KB no matter how
+     * large sold_properties itself gets, so there's nothing a bounds query would save.
+     *
+     * This used to be a live `GROUP BY substr(postcode, ...)` over whatever was in the viewport,
+     * run on every camera-idle event. Its cost scaled with the *area on screen* rather than with
+     * the handful of sectors it returned, so zoomed out it degenerated into a scan of a large
+     * fraction of the table — measured at ~1.6s for Greater London, 4.3s for the south east and
+     * 18.1s for most of England, on a desktop SSD with a warm cache. Because this file is opened
+     * read-only and non-WAL (see [open]), Android gives it a connection pool of exactly one, so
+     * each of those scans also blocked every other query behind it. See build_seed_data.py's
+     * build_sector_stats() for why precomputing loses nothing.
+     *
+     * Lazy so an install that never switches the heatmap on never pays for the read at all, and
+     * so it doesn't land on the already-slow first launch.
      */
-    fun averagePriceBySector(
+    private val sectorStats: List<PostcodeSectorPrice> by lazy { loadSectorStats() }
+
+    /** The sectors whose centroid falls inside the given bounds. A plain in-memory filter over
+     *  [sectorStats] — deliberately not a query. */
+    fun sectorsWithinBounds(
         minLat: Double,
         maxLat: Double,
         minLng: Double,
-        maxLng: Double,
-        sinceDate: String? = null
-    ): List<PostcodeSectorPrice> {
-        val dateClause = if (sinceDate != null) "AND date_of_transfer >= ?" else ""
-        val sql = """
-            SELECT substr(postcode, 1, length(postcode) - 2) AS sector,
-                   AVG(price_gbp), COUNT(*), AVG(latitude), AVG(longitude)
-            FROM sold_properties
-            WHERE latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?
-            $dateClause
-            GROUP BY sector
-        """.trimIndent()
+        maxLng: Double
+    ): List<PostcodeSectorPrice> = sectorStats.filter {
+        it.latitude >= minLat && it.latitude <= maxLat &&
+            it.longitude >= minLng && it.longitude <= maxLng
+    }
 
-        val args = mutableListOf(minLat.toString(), maxLat.toString(), minLng.toString(), maxLng.toString())
-        if (sinceDate != null) args += sinceDate
-
+    private fun loadSectorStats(): List<PostcodeSectorPrice> {
+        val sql = "SELECT sector, average_price_gbp, sale_count, latitude, longitude FROM sector_stats"
         val results = mutableListOf<PostcodeSectorPrice>()
-        db.rawQuery(sql, args.toTypedArray()).use { cursor ->
+        db.rawQuery(sql, null).use { cursor ->
             while (cursor.moveToNext()) {
                 results += PostcodeSectorPrice(
                     sector = cursor.getString(0),
@@ -183,8 +185,24 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
         return results
     }
 
-    /** The most recent sale date anywhere in the bundled dataset, e.g. for a "last 12 months" filter. */
-    fun mostRecentDate(): String? {
+    /**
+     * The most recent sale date anywhere in the bundled dataset, e.g. for a "last 12 months"
+     * filter. Computed at most once per [PriceDatabase]: the file is opened read-only and never
+     * written to, so this can't change while the app is running, but there's no index on
+     * date_of_transfer — the query behind it is a full scan of every row (~0.7s over the current
+     * 9.7M). It used to run on *every* refresh whenever the recency filter or the heatmap was
+     * on, which meant a full scan queued ahead of the bounds query the user was actually waiting
+     * for, on each and every pan and zoom.
+     *
+     * Lazy rather than computed in [open] so an install that never turns either of those
+     * settings on never pays for it at all, and so it doesn't land on the already-slow first
+     * launch (which is busy copying the asset).
+     */
+    private val newestTransferDate: String? by lazy { queryMostRecentDate() }
+
+    fun mostRecentDate(): String? = newestTransferDate
+
+    private fun queryMostRecentDate(): String? {
         db.rawQuery("SELECT MAX(date_of_transfer) FROM sold_properties", null).use { cursor ->
             return if (cursor.moveToFirst()) cursor.getString(0) else null
         }
