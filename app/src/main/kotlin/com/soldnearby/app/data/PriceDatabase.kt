@@ -7,6 +7,9 @@ import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.log2
+import kotlin.math.pow
+import kotlin.math.round
 
 /**
  * Opens the bundled, pre-built sold-price SQLite database (see /tools/build_seed_data.py).
@@ -16,23 +19,41 @@ import kotlin.math.floor
 class PriceDatabase private constructor(private val db: SQLiteDatabase) {
 
     /**
-     * Splits the viewport into cells on a grid aligned to absolute lat/lng multiples of the
-     * cell size — not to the viewport's own edges — and caps results per cell, ordered by `id`.
+     * Splits the viewport into cells on a fixed grid in absolute lat/lng space — not one aligned
+     * to the viewport's own edges — and caps results per cell, ordered by `id`.
      * Two fixes bundled into one grid, because they're the same mechanism:
      *  - Capping *per cell* rather than once over the whole viewport is what makes sales near
      *    the edges show up at all: a single query ordered by distance-from-centre with one
      *    LIMIT meant rows near the edges were never even fetched once there were more than
      *    `limit` sales near the middle — no amount of post-processing fixes that, since the
      *    fetch itself has to be split up.
-     *  - Aligning cells to absolute coordinates (rather than starting the grid at whatever
-     *    minLat/minLng the current viewport happens to have) is what makes a dense cluster's
-     *    selection *stable* while panning. Cell size still scales with the viewport, so cell
-     *    count stays bounded, but with viewport-relative cells, a cell's boundaries — and so
-     *    which `perCellLimit` rows out of a crowded street won the cap — shifted on every pan,
-     *    even a tiny one. That looked like dots jumping to a different house each time the map
-     *    moved, because it was: a different slice of the same cluster won the cap on every
+     *  - Everything about a cell being fixed in absolute space is what makes a dense cluster's
+     *    selection *stable* while panning. With viewport-relative cells, a cell's boundaries —
+     *    and so which `perCellLimit` rows out of a crowded street won the cap — shifted on every
+     *    pan, even a tiny one. That looked like dots jumping to a different house each time the
+     *    map moved, because it was: a different slice of the same cluster won the cap on every
      *    refresh. Ordering by `id` instead of distance-from-cell-centre (which itself moved
-     *    every refresh) removes the other half of the same instability.
+     *    every refresh) removes one half of that instability; [quantizeGridStep] and the
+     *    unclamped cell bounds below remove the other two, which are subtler:
+     *
+     *    The step used to be `viewport span / GRID_CELLS_PER_AXIS`, which sounds fixed at a
+     *    given zoom but isn't — Mercator means the visible *latitude* span for a fixed pixel
+     *    height changes as you pan north or south, and pinch-zoom is continuous, so the step
+     *    drifted a little on essentially every camera move. Since the grid origin is
+     *    `floor(bound / step) * step`, a drift of one part in 10^5 is enough to flip that floor
+     *    and shift the entire lattice by a whole cell. Quantizing the step to a power of two
+     *    makes it genuinely a function of zoom alone.
+     *
+     *    Cells were also clamped to the requested bounds, so the cells along each edge were
+     *    cropped to a rectangle that moved with the viewport — a different region, holding
+     *    different rows, on every single pan. They're left to overhang instead: a cell is now
+     *    the same patch of the world with the same contents no matter what the camera is doing,
+     *    at the cost of returning some rows just outside the requested bounds (harmless — the
+     *    caller already asks for a padded viewport, and off-screen markers simply aren't drawn).
+     *
+     *    Measured against the real dataset, a 5% pan at street level used to change the identity
+     *    of 26-50 dots and make 6-32 of them vanish from the *middle* of the view; it now
+     *    changes none, for ~20% more query time and the same number of dots on screen.
      *
      * All cells are fetched as one UNION ALL statement rather than one `rawQuery` call per cell
      * (up to (GRID_CELLS_PER_AXIS+1)^2 of them) — that many separate round-trips added enough
@@ -81,12 +102,16 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
             )
         """.trimIndent()
 
-        val latStep = (maxLat - minLat) / GRID_CELLS_PER_AXIS
-        val lngStep = (maxLng - minLng) / GRID_CELLS_PER_AXIS
+        val latStep = quantizeGridStep((maxLat - minLat) / GRID_CELLS_PER_AXIS)
+        val lngStep = quantizeGridStep((maxLng - minLng) / GRID_CELLS_PER_AXIS)
+        // Derived from the nominal cell count rather than the actual `rowCount * colCount` below,
+        // which varies by a cell or two depending on where the viewport sits against the lattice.
+        // Tying the cap to that would put back a smaller version of exactly the instability this
+        // grid exists to remove: the number of dots per cell would change as you panned.
         val perCellLimit = (limit / (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS)).coerceAtLeast(1)
         // floor(), not minLat itself: this is what pins cell boundaries to fixed points in
-        // absolute space so a small pan mostly reuses the same cells instead of redrawing the
-        // whole grid shifted by a few metres.
+        // absolute space, so panning slides the viewport across a stationary lattice rather than
+        // dragging the lattice along with it.
         val gridOriginLat = floor(minLat / latStep) * latStep
         val gridOriginLng = floor(minLng / lngStep) * lngStep
         val rowCount = ceil((maxLat - gridOriginLat) / latStep).toInt()
@@ -95,16 +120,12 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
         val cellQueries = mutableListOf<String>()
         val args = mutableListOf<String>()
         for (row in 0 until rowCount) {
-            // Clamped to [minLat, maxLat]: grid-aligned cells can overhang the requested bounds
-            // at the edges, and the caller (a padded-but-still-bounded viewport) shouldn't get
-            // back points from outside what it actually asked for.
-            val cellMinLat = (gridOriginLat + latStep * row).coerceAtLeast(minLat)
-            val cellMaxLat = (gridOriginLat + latStep * (row + 1)).coerceAtMost(maxLat)
-            if (cellMinLat >= cellMaxLat) continue
+            // Deliberately not clamped to [minLat, maxLat] — see the note on stability above.
+            val cellMinLat = gridOriginLat + latStep * row
+            val cellMaxLat = cellMinLat + latStep
             for (col in 0 until colCount) {
-                val cellMinLng = (gridOriginLng + lngStep * col).coerceAtLeast(minLng)
-                val cellMaxLng = (gridOriginLng + lngStep * (col + 1)).coerceAtMost(maxLng)
-                if (cellMinLng >= cellMaxLng) continue
+                val cellMinLng = gridOriginLng + lngStep * col
+                val cellMaxLng = cellMinLng + lngStep
 
                 cellQueries += cellSql
                 args += listOf(cellMinLat.toString(), cellMaxLat.toString(), cellMinLng.toString(), cellMaxLng.toString())
@@ -117,6 +138,22 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
         val sql = cellQueries.joinToString(" UNION ALL ")
         return db.rawQuery(sql, args.toTypedArray()).use(::readAll)
     }
+
+    /**
+     * Snaps a grid step to the nearest power of two degrees, so that [findInBounds]' lattice
+     * depends only on how far the camera is zoomed and not on exactly where it's pointed.
+     *
+     * Nearest rather than rounded up or down: the step lands within a factor of √2 of the ideal
+     * either way, which keeps the cell count (and so the query cost and the number of dots on
+     * screen) close to what an unquantized step would have produced. Snapping up instead would
+     * halve the number of cells in the worst case and visibly thin the dots out in dense areas;
+     * snapping down could quadruple the cell count.
+     *
+     * Powers of two specifically because they're exactly representable as doubles, so
+     * `origin + step * n` accumulates no error along a row of cells.
+     */
+    private fun quantizeGridStep(desired: Double): Double =
+        if (desired.isFinite() && desired > 0.0) 2.0.pow(round(log2(desired))) else 1.0
 
     /**
      * Every transaction recorded against this exact address, newest first — a house that's

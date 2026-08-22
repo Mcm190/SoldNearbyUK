@@ -43,6 +43,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.google.gson.JsonObject
 import com.soldnearby.app.R
 import com.soldnearby.app.data.AppSettings
@@ -59,9 +60,9 @@ import com.soldnearby.app.util.formatGbp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.maplibre.android.annotations.MarkerOptions
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -78,21 +79,37 @@ import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.Point
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /** Used only until we have a real location fix (or if permission is denied). */
 private val LONDON_FALLBACK = LatLng(51.5074, -0.1278)
 private const val STYLE_LIGHT = "https://tiles.openfreemap.org/styles/liberty"
 private const val STYLE_DARK = "https://tiles.openfreemap.org/styles/dark"
 
-/** This app's data is UK-only (see build_seed_data.py) so nowhere else on the map is ever
- *  useful — a loose box around Great Britain, Northern Ireland, and the surrounding islands,
- *  wide enough to include Shetland and the Channel Islands without allowing a pan out into
- *  open ocean or another country. */
-private val UK_BOUNDS = LatLngBounds.from(latNorth = 61.0, lonEast = 2.0, latSouth = 49.8, lonWest = -8.75)
-/** Keeps a pinch-out from zooming past roughly "the whole UK fills the screen" — paired with
- *  [UK_BOUNDS], since the bounds alone only restrict the camera *target*, not how far out you
- *  can zoom while centred near an edge. */
-private const val UK_MIN_ZOOM = 4.5
+/** Nowhere outside the dataset is ever useful to look at, so the camera target is boxed in to
+ *  roughly where the data actually is, plus about 25km of margin on each side.
+ *
+ *  That's England and Wales — HM Land Registry's Price Paid Data doesn't cover Scotland or
+ *  Northern Ireland (they have their own registers), so despite the app's name there is nothing
+ *  north of the Scottish border to show. Measured over the current build, every row falls inside
+ *  lat 49.895..55.797, lng -6.353..1.763 — Scilly in the south west, Berwick in the north,
+ *  Lowestoft in the east — with no outliers beyond.
+ *
+ *  This used to reach to lat 61 and lng -8.75, a box drawn around the whole UK including
+ *  Shetland. Since it only constrains the camera *target*, that let you pan the centre of the
+ *  screen hundreds of miles into empty ocean or up to Scotland, where the map is guaranteed to
+ *  be blank — the app looking broken when it was really just pointed somewhere it has no data
+ *  for. */
+private val UK_BOUNDS = LatLngBounds.from(latNorth = 56.05, lonEast = 2.15, latSouth = 49.65, lonWest = -6.75)
+/** Keeps a pinch-out from zooming past roughly "the whole dataset fills the screen" — paired
+ *  with [UK_BOUNDS], since the bounds alone only restrict the camera *target*, not how far out
+ *  you can zoom while centred near an edge.
+ *
+ *  Deliberately no higher than this: at this zoom the England-and-Wales box is 311 x 375dp, so
+ *  it still fits edge to edge across the narrowest screen Android phones realistically have
+ *  (320dp). Raising it further would frame the data more tightly on a typical handset but leave
+ *  someone on a narrow one unable to see the whole country at once, which is the worse trade. */
+private const val UK_MIN_ZOOM = 4.75
 
 /** Below this, individual house dots don't mean much and just look like clutter/a clump —
  *  real map apps hide or cluster POI-level markers at low zoom for the same reason. */
@@ -116,11 +133,32 @@ private const val MY_LOCATION_SOURCE_ID = "my-location-source"
 private const val MY_LOCATION_LAYER_ID = "my-location-layer"
 private const val MY_LOCATION_IMAGE_ID = "my-location-icon"
 
-/** How often the "you are here" dot re-fetches a fix and moves to follow the user. Only the
+/** How often the "you are here" dot asks for a fix and moves to follow the user. Only the
  *  dot follows on this cadence — the camera never does, so panning/zooming around the map
  *  stays completely free; it only snaps to the latest fix when the locate-me button is
  *  pressed (see centerOnCurrentLocation). */
-private const val MY_LOCATION_POLL_INTERVAL_MS = 1500L
+private const val MY_LOCATION_UPDATE_INTERVAL_MS = 1500L
+
+/** The zoom the camera settles at whenever it centres on a specific place — the user's
+ *  own position, or a search result. */
+private const val CENTRED_ZOOM = 14.5
+
+/** How long the locate-me button waits for a brand-new fix before giving up on refining the
+ *  position it already snapped to. Only ever affects the *second* of that button's two camera
+ *  moves — the first one has already happened by the time this starts. */
+private const val LOCATE_FRESH_FIX_TIMEOUT_MS = 8000L
+
+/** A cached fix older than this isn't used to snap the camera. Play Services' "last known"
+ *  location has no age limit of its own, and jumping to where the phone was hours ago is worse
+ *  than not jumping at all. Generous because the live subscription (see locationUpdates) keeps
+ *  the fix current whenever the app is actually on screen — this bound only really matters for
+ *  the first press after a cold start. */
+private const val LOCATE_CACHED_FIX_MAX_AGE_MS = 120_000L
+
+/** How far a freshly-acquired fix has to be from the one the camera already snapped to before
+ *  it's worth animating a second time. Below this the correction isn't visible at [CENTRED_ZOOM]
+ *  and the extra movement just reads as the map drifting on its own. */
+private const val LOCATE_REFINE_MIN_METRES = 30.0
 
 @Composable
 fun MapScreen(
@@ -161,7 +199,9 @@ fun MapScreen(
     var nearbyProperties by remember { mutableStateOf<List<SoldProperty>>(emptyList()) }
     var isZoomedOutTooFar by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
-    var searchError by remember { mutableStateOf<String?>(null) }
+    // The screen's one transient-message slot, shown as a banner under the search bar.
+    // Shared by search and by the locate-me button, which is why it isn't named for either.
+    var bannerMessage by remember { mutableStateOf<String?>(null) }
     // Constructed once and reused for the life of the screen — PropertyRepository.open() checks
     // for/copies the multi-GB bundled asset and opens a SQLite handle, so building a fresh one
     // on every pan/zoom (as this used to) was real, avoidable I/O on every camera-idle event.
@@ -190,11 +230,15 @@ fun MapScreen(
     // refreshVisibleProperties() calls removeAnnotations() on every pan/zoom, which would wipe
     // out an annotation-based pin along with the sold-price dots.
     var myLocationSource by remember { mutableStateOf<GeoJsonSource?>(null) }
-    // The last position pushed to myLocationSource, kept around so a style swap (dark-mode
-    // toggle) — which replaces the whole Style, wiping myLocationSource along with it — can
-    // restore the pin on the freshly re-added source instead of leaving it blank until the
-    // next GPS fix.
-    var lastLocationFix by remember { mutableStateOf<LatLng?>(null) }
+    // The last position pushed to myLocationSource, kept around for two things: a style swap
+    // (dark-mode toggle) — which replaces the whole Style, wiping myLocationSource along with
+    // it — can restore the pin on the freshly re-added source instead of leaving it blank until
+    // the next GPS fix; and the locate-me button reads it to move the camera immediately,
+    // without waiting on the location hardware (see centerOnCurrentLocation).
+    // Deliberately *not* Compose state: it's written on every fix that arrives, and nothing on
+    // screen is derived from it by composition (both readers are callbacks), so making it
+    // observable would recompose this whole screen once or twice a second for no redraw.
+    val lastLocationFix = remember { AtomicReference<LatLng?>(null) }
     // The map fires a camera-idle event of its own right after the style loads, before we've
     // centred on anything meaningful. This flag stops that one from triggering a real load.
     var hasRequestedInitialCenter by remember { mutableStateOf(false) }
@@ -203,6 +247,10 @@ fun MapScreen(
     // one's DB query run to completion would mean multiple queries racing to redraw the map with
     // whichever happens to finish last, not the one for where the camera actually ended up.
     var refreshJob by remember { mutableStateOf<Job?>(null) }
+    // Whatever centring-on-the-user is currently in flight, cancelled by the next request for
+    // one. Without this, a press whose fresh-fix request is still outstanding can resolve after
+    // a later press already moved the camera, and yank it back to the older position.
+    var locateJob by remember { mutableStateOf<Job?>(null) }
     // Incremented by triggerRefresh on every launch, and captured by the coroutine it launches,
     // so a refresh can tell whether it's still the current one when it finishes — see
     // triggerRefresh for what that's for. A plain counter rather than Compose state on purpose:
@@ -230,6 +278,15 @@ fun MapScreen(
     // to whatever's currently loaded — the low/high end of the scale is always "quietest/busiest
     // sector on screen right now", not a fixed nationwide scale, so it stays meaningful whether
     // you're looking at central London or a small town, and updates as you pan elsewhere.
+    //
+    // Scaled between the 5th and 95th percentile rather than between the outright min and max,
+    // which are single sectors and behave like it. Nationwide the extremes are 1 sale and 987,
+    // so one outlier set the top of the scale and squashed the median sector (195 sales) down to
+    // a weight of 0.2; worse, both ends were a step function of whether that one sector happened
+    // to be on screen, so panning it in or out visibly rescaled the entire heatmap at once.
+    // Percentiles move smoothly as you pan and put the median sector near the middle of the
+    // range where it belongs.
+    //
     // Building the FeatureCollection is done off the main thread (setGeoJson itself still has to
     // happen on it): zoomed all the way out this is every sector in the country — ~8k points to
     // allocate and serialise — which is enough to drop frames if it runs on the UI thread.
@@ -239,11 +296,17 @@ fun MapScreen(
             return
         }
         val collection = withContext(Dispatchers.Default) {
-            val counts = sectors.map { it.saleCount }
-            val minCount = counts.min()
-            val range = (counts.max() - minCount).let { if (it <= 0) 1 else it }
+            val sorted = sectors.map { it.saleCount }.sorted()
+            val low = sorted[(sorted.size - 1) * 5 / 100]
+            val high = sorted[(sorted.size - 1) * 95 / 100]
+            val range = (high - low).toDouble()
             val features = sectors.map { sector ->
-                val weight = ((sector.saleCount - minCount).toDouble() / range).coerceIn(0.0, 1.0)
+                // range == 0 means every sector in view is equally busy (or there's only one),
+                // in which case there's no contrast to show and a flat full weight is the honest
+                // rendering — normalizing would divide by zero or wash the lot out to nothing.
+                val weight =
+                    if (range <= 0.0) 1.0
+                    else ((sector.saleCount - low) / range).coerceIn(0.0, 1.0)
                 val properties = JsonObject().apply { addProperty("weight", weight) }
                 Feature.fromGeometry(Point.fromLngLat(sector.longitude, sector.latitude), properties)
             }
@@ -259,7 +322,7 @@ fun MapScreen(
     // Empty position clears the pin (permission denied, or a fix that never resolved) rather
     // than leaving a stale one sitting somewhere the user no longer is.
     fun updateMyLocationSource(position: LatLng?) {
-        lastLocationFix = position
+        lastLocationFix.set(position)
         val source = myLocationSource ?: return
         if (position == null) {
             source.setGeoJson(FeatureCollection.fromFeatures(emptyArray()))
@@ -393,21 +456,82 @@ fun MapScreen(
         }
     }
 
-    suspend fun centerOnCurrentLocation() {
+    // Moves the camera to the user in two stages, and the first one is the point of the whole
+    // arrangement: it uses a position already in hand, so the map starts moving on the same
+    // frame as the tap, every time.
+    //
+    // This used to be one stage — await currentLocation(), then animate — which meant the
+    // button did nothing at all until the location hardware produced a brand-new fix. The very
+    // first press was reliably instant because startup had just fetched one and the engine was
+    // still warm; later presses, after the user had moved around, had to wait out a real
+    // acquisition (seconds indoors, sometimes never), and a press that resolved to null
+    // *animated the camera to London* and cleared the "you are here" dot on the way past. That
+    // is the reported "sometimes it doesn't snap".
+    //
+    // Stage two still asks for a genuinely fresh fix and corrects the camera if it lands more
+    // than LOCATE_REFINE_MIN_METRES from where stage one put it, so accuracy isn't traded away
+    // for the responsiveness — it's just no longer on the critical path. A null or timed-out
+    // stage two now leaves both camera and dot exactly where stage one put them.
+    suspend fun centerOnCurrentLocation(isInitialCentring: Boolean) {
         val currentMap = map ?: return
+        // Set before any camera move, not after: it gates the camera-idle listener that loads
+        // the markers, and that listener fires when the animation *ends*.
         hasRequestedInitialCenter = true
-        val gpsFix = if (hasLocationPermission) {
-            runCatching { locationTracker.currentLocation() }.getOrNull()
-                ?.let { (lat, lng) -> LatLng(lat, lng) }
-        } else {
-            null
+
+        // Falling back to London is only ever right for the very first centring, and only when
+        // there's nothing better anywhere — it isn't where the user is, so a locate-me press
+        // must never end up there.
+        fun settleForFallback() {
+            if (isInitialCentring) {
+                currentMap.animateCamera(CameraUpdateFactory.newLatLngZoom(LONDON_FALLBACK, CENTRED_ZOOM))
+            }
         }
-        // Only ever reflects a real fix — never drawn at the London fallback, which isn't
-        // actually where the user is.
-        updateMyLocationSource(gpsFix)
-        // Loading happens once this settles and the camera-idle listener below fires —
-        // not here — so a manual pan afterwards and a GPS re-centre go through one path.
-        currentMap.animateCamera(CameraUpdateFactory.newLatLngZoom(gpsFix ?: LONDON_FALLBACK, 14.5))
+
+        if (!hasLocationPermission) {
+            updateMyLocationSource(null)
+            settleForFallback()
+            return
+        }
+        if (!isInitialCentring) bannerMessage = null
+
+        // Stage one: the live subscription's latest fix, or failing that Play Services' cache.
+        val known = lastLocationFix.get()
+            ?: runCatching { locationTracker.lastKnownLocation(LOCATE_CACHED_FIX_MAX_AGE_MS) }
+                .getOrNull()?.let { (lat, lng) -> LatLng(lat, lng) }
+        if (known != null) {
+            updateMyLocationSource(known)
+            currentMap.animateCamera(CameraUpdateFactory.newLatLngZoom(known, CENTRED_ZOOM))
+        }
+
+        // Stage two: a real acquisition, bounded so a fix that never arrives can't leave this
+        // coroutine (and with it the next press's cancellation target) hanging around forever.
+        val fresh = withTimeoutOrNull(LOCATE_FRESH_FIX_TIMEOUT_MS) {
+            runCatching { locationTracker.currentLocation(highAccuracy = true) }.getOrNull()
+        }?.let { (lat, lng) -> LatLng(lat, lng) }
+
+        if (fresh == null) {
+            if (known == null) {
+                // Nothing cached and nothing acquired: there is no position to snap to, so the
+                // button has genuinely done nothing — say so rather than leaving it looking
+                // broken (or, as it used to, silently flying the map to London). Usually means
+                // location is switched off device-wide, or an emulator with no fix set.
+                if (!isInitialCentring) bannerMessage = "Couldn't get your location — check location is turned on."
+                settleForFallback()
+            }
+            return
+        }
+        updateMyLocationSource(fresh)
+        if (known == null || known.distanceTo(fresh) > LOCATE_REFINE_MIN_METRES) {
+            currentMap.animateCamera(CameraUpdateFactory.newLatLngZoom(fresh, CENTRED_ZOOM))
+        }
+    }
+
+    // Every centring goes through here so that each one cancels the last. Loading the markers
+    // happens once the camera settles and the camera-idle listener fires — never from in here —
+    // so a manual pan and a GPS re-centre go through one path.
+    fun requestCenterOnCurrentLocation(isInitialCentring: Boolean) {
+        locateJob?.cancel()
+        locateJob = scope.launch { centerOnCurrentLocation(isInitialCentring) }
     }
 
     suspend fun performSearch() {
@@ -415,16 +539,18 @@ fun MapScreen(
         val currentMap = map
         if (query.isBlank() || currentMap == null) return
         keyboardController?.hide()
-        searchError = null
+        bannerMessage = null
         isLoading = true
         val result = GeocodeSearch.search(query)
         isLoading = false
         if (result == null) {
-            searchError = "Couldn't find \"$query\""
+            bannerMessage = "Couldn't find \"$query\""
             return
         }
         hasRequestedInitialCenter = true
-        currentMap.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(result.latitude, result.longitude), 14.5))
+        currentMap.animateCamera(
+            CameraUpdateFactory.newLatLngZoom(LatLng(result.latitude, result.longitude), CENTRED_ZOOM)
+        )
     }
 
     LaunchedEffect(Unit) {
@@ -436,27 +562,26 @@ fun MapScreen(
     }
 
     LaunchedEffect(map, hasLocationPermission) {
-        centerOnCurrentLocation()
+        if (map != null) requestCenterOnCurrentLocation(isInitialCentring = true)
     }
 
     // Keeps the "you are here" dot following the user as they actually move, instead of the
     // one-shot fix above going stale the moment they walk/drive away from where the app was
-    // opened. Deliberately only ever touches the dot (updateMyLocationSource), never the
-    // camera — free panning/zooming stays free, and the map only snaps to the latest fix when
-    // the locate-me button calls centerOnCurrentLocation() directly.
+    // opened — and, just as importantly, keeps lastLocationFix current so the locate-me button
+    // has somewhere accurate to snap to immediately. Deliberately only ever touches the dot
+    // (updateMyLocationSource), never the camera: free panning/zooming stays free, and the map
+    // only moves when centerOnCurrentLocation is called.
+    //
+    // repeatOnLifecycle(STARTED) rather than a poll loop that checks the lifecycle itself:
+    // below STARTED onStop has already fired, so there's no visible dot to update and no reason
+    // to keep the location engine running for a screen no one can see. Ending the collection is
+    // what actually unsubscribes (see locationUpdates' awaitClose), where the old loop only
+    // skipped its turn and kept the timer going.
     LaunchedEffect(map, hasLocationPermission) {
         if (map == null || !hasLocationPermission) return@LaunchedEffect
-        while (isActive) {
-            delay(MY_LOCATION_POLL_INTERVAL_MS)
-            // Skips the fetch (rather than just skipping the camera/UI update) while the app is
-            // backgrounded — below STARTED means onStop has already fired, so there's no visible
-            // dot to update anyway, and there's no reason to keep pinging GPS for a screen no
-            // one can see.
-            if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) continue
-            val gpsFix = runCatching { locationTracker.currentLocation() }.getOrNull()
-                ?.let { (lat, lng) -> LatLng(lat, lng) }
-            if (gpsFix != null) {
-                updateMyLocationSource(gpsFix)
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            locationTracker.locationUpdates(MY_LOCATION_UPDATE_INTERVAL_MS).collect { (lat, lng) ->
+                updateMyLocationSource(LatLng(lat, lng))
             }
         }
     }
@@ -535,43 +660,86 @@ fun MapScreen(
                             // "weight" is pre-normalized to 0..1 in updateHeatmapSource, relative
                             // to whatever sectors are currently loaded — not a fixed density scale.
                             PropertyFactory.heatmapWeight(Expression.get("weight")),
+                            // Radius and intensity are one setting in two halves, and the pair is
+                            // what stops the country turning into a single red blob when zoomed
+                            // out. MapLibre *accumulates* every point's kernel: the density at a
+                            // pixel is the sum of (weight x intensity x gaussian) over every
+                            // sector within a radius of it, and the colour ramp below is sampled
+                            // at min(density, 1) — so once enough kernels overlap, everything is
+                            // pinned to the top of the ramp and all contrast is gone.
+                            //
+                            // How much they overlap is what changes with zoom. Zoomed out, all
+                            // ~8k sectors are on screen at once, only a pixel or two apart; the
+                            // previous stops (which interpolate() clamps to a flat 60px radius
+                            // and 1.5 intensity below zoom 8) put ~1,100 kernels within a radius
+                            // of a typical pixel over England, for a density around 30 where the
+                            // ramp tops out at 1. Simulated against the real sector_stats table,
+                            // that left 79% of the land area at the maximum-red stop at zoom 6.5
+                            // — the reported blob, and not really a colour choice at all but an
+                            // arithmetic overflow of the accumulation.
+                            //
+                            // So: shrink the radius sharply as zoom decreases (fewer overlapping
+                            // kernels), and drop the intensity along with it (each contributes
+                            // less) — enough that the busiest sectors land near 1.0 instead of
+                            // 30. Same simulation now puts under 3% of the screen at the top
+                            // stop at every zoom, with cities reading as distinct hot spots on a
+                            // cool country rather than the whole map reading as one hot spot.
+                            // These are eyeballed as well as computed; if the surface ever looks
+                            // washed out or blown out again, this pair is the place to adjust.
                             PropertyFactory.heatmapIntensity(
                                 Expression.interpolate(
                                     Expression.linear(), Expression.zoom(),
-                                    Expression.stop(8, 1.5f), Expression.stop(15, 4f)
+                                    Expression.stop(4, 0.16f), Expression.stop(7, 0.27f),
+                                    Expression.stop(9, 0.48f), Expression.stop(10.5, 1.25f),
+                                    Expression.stop(12, 1.9f), Expression.stop(14, 3.1f),
+                                    Expression.stop(16, 3.4f)
                                 )
                             ),
                             // salesDensityBySector returns one point per postcode sector, not
                             // one per sale — sparse compared to a per-transaction heatmap would
-                            // be. A small radius (the old 20-90px) left each sector as an
-                            // isolated soft dot with visible map showing through the gaps
-                            // between them, instead of neighbouring sectors' blobs overlapping
-                            // into one continuous surface. Much bigger radius is what makes
-                            // sparse points read as continuous coverage.
+                            // be. Zoomed in, the radius has to stay well above the on-screen gap
+                            // between neighbouring sectors or each one reads as an isolated soft
+                            // dot with map showing through between them; zoomed out that gap
+                            // collapses to a pixel or two and the same radius is what buries the
+                            // country (see above), so it has to collapse with it.
                             PropertyFactory.heatmapRadius(
                                 Expression.interpolate(
                                     Expression.linear(), Expression.zoom(),
-                                    Expression.stop(8, 60f), Expression.stop(16, 220f)
+                                    Expression.stop(4, 9f), Expression.stop(6, 14f),
+                                    Expression.stop(8, 24f), Expression.stop(10, 42f),
+                                    Expression.stop(12, 80f), Expression.stop(14, 150f),
+                                    Expression.stop(16, 220f)
                                 )
                             ),
                             // Subtle: lower ceiling than a typical heatmap (0.7), so it reads as
-                            // a tint over the map rather than obscuring it.
-                            PropertyFactory.heatmapOpacity(0.45f),
+                            // a tint over the map rather than obscuring it. Slightly higher than
+                            // it was only because it no longer sits on top of a surface that was
+                            // saturated everywhere — the same value now looks fainter.
+                            PropertyFactory.heatmapOpacity(0.55f),
                             PropertyFactory.heatmapColor(
                                 Expression.interpolate(
                                     Expression.linear(), Expression.heatmapDensity(),
-                                    // Feathers in fully transparent, well before the first
-                                    // colour stop, so a blob's edge fades out gradually instead
-                                    // of an abrupt transparent-to-blue boundary — that's what
-                                    // lets adjacent sectors' blobs blend rather than looking
+                                    // Stops bunched towards the bottom rather than spread evenly,
+                                    // because the accumulated density is: across one view the
+                                    // quiet edges and the busiest core differ by ~50x, so evenly
+                                    // spaced stops spend most of the ramp on values almost
+                                    // nothing has, showing a hot core over a uniformly blank
+                                    // surround. Roughly logarithmic spacing gives the sparse end
+                                    // somewhere to land, which is what makes a town read as a
+                                    // town rather than as empty map.
+                                    //
+                                    // Still feathers in from fully transparent well before the
+                                    // first colour stop, so a blob's edge fades out gradually
+                                    // instead of an abrupt transparent-to-blue boundary — that's
+                                    // what lets adjacent sectors' blobs blend rather than looking
                                     // like separate circles butted up against each other.
                                     Expression.stop(0, "rgba(0,0,0,0)"),
-                                    Expression.stop(0.1, "rgba(33,102,172,0.2)"),
-                                    Expression.stop(0.3, "rgba(33,102,172,0.5)"),
-                                    Expression.stop(0.45, "rgba(103,169,207,0.65)"),
-                                    Expression.stop(0.6, "rgba(253,219,199,0.75)"),
-                                    Expression.stop(0.8, "rgba(239,138,98,0.85)"),
-                                    Expression.stop(1, "rgba(178,24,43,0.95)")
+                                    Expression.stop(0.015, "rgba(33,102,172,0.12)"),
+                                    Expression.stop(0.05, "rgba(33,102,172,0.35)"),
+                                    Expression.stop(0.12, "rgba(103,169,207,0.55)"),
+                                    Expression.stop(0.25, "rgba(253,219,199,0.65)"),
+                                    Expression.stop(0.5, "rgba(239,138,98,0.8)"),
+                                    Expression.stop(1, "rgba(178,24,43,0.92)")
                                 )
                             )
                         )
@@ -599,7 +767,7 @@ fun MapScreen(
                 // heatmap by re-running the same query the current viewport/settings would
                 // produce anyway — both sources are freshly empty right after being re-added
                 // above.
-                updateMyLocationSource(lastLocationFix)
+                updateMyLocationSource(lastLocationFix.get())
                 if (hasRequestedInitialCenter) {
                     triggerRefresh()
                 }
@@ -650,13 +818,13 @@ fun MapScreen(
                 query = searchQuery,
                 onQueryChange = {
                     searchQuery = it
-                    searchError = null
+                    bannerMessage = null
                 },
                 onSearch = { scope.launch { performSearch() } },
                 onOpenSettings = onOpenSettings
             )
 
-            searchError?.let { error ->
+            bannerMessage?.let { error ->
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -783,7 +951,7 @@ fun MapScreen(
         // and the card's own Close button already covers "get me out of this".
         if (selectedProperty == null) {
             FloatingActionButton(
-                onClick = { scope.launch { centerOnCurrentLocation() } },
+                onClick = { requestCenterOnCurrentLocation(isInitialCentring = false) },
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(16.dp)
