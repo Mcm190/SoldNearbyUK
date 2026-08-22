@@ -24,4 +24,4 @@ seed_data/src/main/assets/seed_prices.version
 tools/.bundletool-all.jar
 
 # Scratch workspace used to build sideloadable release APKs — not part of the project.
-/github/
+/sideload_build/
