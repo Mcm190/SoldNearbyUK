@@ -70,12 +70,13 @@ class PropertyRepository(context: Context) {
         db.historyForAddress(address = property.address, postcode = property.postcode)
     }
 
-    /** Sale counts per postcode sector within bounds, over the last 2 years — the data behind
-     *  the "recent sales heatmap". Always a fixed 2-year window regardless of the "recent sales
-     *  only" toggle (that one controls the dots; this is a separate, heatmap-only setting of
-     *  what "recent" means). Anchored to the newest sale actually in the bundled dataset, not
-     *  today, for the same reason as [recentCutoff] — the data doesn't necessarily reach up to
-     *  today, so anchoring on "today" could filter out everything.
+    /** Sale counts per postcode sector within bounds, over the last 2 years — the *coarse* tier
+     *  of the "recent sales heatmap", for zoomed-out views. Always a fixed 2-year window
+     *  regardless of the "recent sales only" toggle (that one controls the dots; this is a
+     *  separate, heatmap-only setting of what "recent" means). Anchored to the newest sale
+     *  actually in the bundled dataset, not today, for the same reason as [recentCutoff] — the
+     *  data doesn't necessarily reach up to today, so anchoring on "today" could filter out
+     *  everything.
      *
      *  Because none of that varies at runtime, the window is applied once at build time and this
      *  is now a filter over an in-memory table rather than a query (see
@@ -90,5 +91,29 @@ class PropertyRepository(context: Context) {
         maxLng: Double
     ): List<PostcodeSectorPrice> = withContext(queryDispatcher) {
         db.sectorsWithinBounds(minLat = minLat, maxLat = maxLat, minLng = minLng, maxLng = maxLng)
+    }
+
+    /** Sale counts per full postcode within bounds, over the same 2-year window as
+     *  [salesDensityBySector] — the *fine* tier of the heatmap, for zoomed-in views.
+     *
+     *  One point per sector can't describe a street: measured against the bundled dataset, a
+     *  zoom-16 view holds 3 sector centroids over Ipswich, each placed at a mean of its
+     *  sector's sale coordinates and so sitting a mean 254-395m (up to 1.6km) from the sales it
+     *  stands for. That's why the heat visibly failed to sit over the dots once zoomed in. Each
+     *  row here is instead at the exact coordinate the map draws that postcode's dot at.
+     *
+     *  Unlike [salesDensityBySector] this is a genuine bounds query rather than an in-memory
+     *  filter — ~749k rows is far too many to hold — so the caller must gate it on zoom; see
+     *  [PriceDatabase.postcodesWithinBounds] for the measured cost. */
+    suspend fun postcodeDensityWithinBounds(
+        minLat: Double,
+        maxLat: Double,
+        minLng: Double,
+        maxLng: Double,
+        limit: Int
+    ): List<PostcodeDensity> = withContext(queryDispatcher) {
+        db.postcodesWithinBounds(
+            minLat = minLat, maxLat = maxLat, minLng = minLng, maxLng = maxLng, limit = limit
+        )
     }
 }

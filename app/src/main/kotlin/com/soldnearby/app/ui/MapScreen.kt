@@ -47,6 +47,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.google.gson.JsonObject
 import com.soldnearby.app.R
 import com.soldnearby.app.data.AppSettings
+import com.soldnearby.app.data.PostcodeDensity
 import com.soldnearby.app.data.PostcodeSectorPrice
 import com.soldnearby.app.data.PropertyRepository
 import com.soldnearby.app.data.SoldProperty
@@ -57,6 +58,7 @@ import com.soldnearby.app.ui.theme.LocationBlue
 import com.soldnearby.app.ui.theme.MultiSaleRed
 import com.soldnearby.app.util.createDotIcon
 import com.soldnearby.app.util.formatGbp
+import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -129,6 +131,46 @@ private const val REFRESH_DEBOUNCE_MS = 250L
 
 private const val HEATMAP_SOURCE_ID = "sector-density-heatmap-source"
 private const val HEATMAP_LAYER_ID = "sector-density-heatmap-layer"
+private const val FINE_HEATMAP_SOURCE_ID = "postcode-density-heatmap-source"
+private const val FINE_HEATMAP_LAYER_ID = "postcode-density-heatmap-layer"
+
+/** Where the heatmap stops describing sectors and starts describing individual postcodes, and
+ *  where that handover has finished.
+ *
+ *  One point per postcode *sector* simply runs out of resolution as you zoom in. Measured
+ *  against the bundled dataset, a padded viewport holds 3 sector centroids over Ipswich and 30
+ *  over central London at zoom 16 — and each of those points sits at the mean of its sector's
+ *  sale coordinates, a mean 254-395m and up to 1.6km from the sales it stands for. A handful of
+ *  Gaussian blobs at averaged positions can't say which street is busy, which is why the heat
+ *  didn't sit over the dots underneath it. Above this the source switches to postcode_stats,
+ *  whose points are the exact coordinates the dots are drawn at.
+ *
+ *  13.5 rather than lower because the fine tier's cost scales with the area on screen: a padded
+ *  central-London viewport — the densest in the country — holds ~11k postcodes at 13.5 and ~5.7k
+ *  at 14, but ~34k at 12.5. Deliberately *not* equal to [MIN_ZOOM_FOR_DOTS] either, so the dots
+ *  appearing and the heat surface changing resolution aren't the same moment on the way in. */
+private const val MIN_ZOOM_FOR_FINE_HEAT = 13.5
+private const val FINE_HEAT_FULL_ZOOM = 14.0
+
+/** A bound on how many postcode points one refresh will hold, not a shaping choice — unlike
+ *  findInBounds' per-cell cap, which deliberately samples the dots, dropping heat points would
+ *  understate the very density this layer exists to show.
+ *
+ *  It must never actually bind, because the query behind it has no ORDER BY: it reads straight
+ *  off idx_postcode_stats_lat_lng, so a truncated result is the *southernmost* N points of the
+ *  view and the heat would simply stop along a horizontal line partway up the screen. Sizing is
+ *  therefore about headroom, not about a typical case.
+ *
+ *  Measured worst case is ~10.5k, searching the densest z13.5-sized window in the country (inner
+ *  London, sampled over the 400 busiest grid cells) against a 1080x2000 phone viewport. This app
+ *  also ships for tablets, and a 10-inch one has roughly twice that pixel area and so sees
+ *  roughly twice the postcodes — call it ~21k. 50k leaves headroom past even that, on a device
+ *  with a viewport around five times a phone's. */
+private const val FINE_HEAT_MAX_POINTS = 50_000
+
+/** Ceiling of the heat tint, for both tiers. Deliberately below a typical heatmap's 0.7 so it
+ *  reads as a tint over the map rather than obscuring it. */
+private const val HEATMAP_MAX_OPACITY = 0.55f
 private const val MY_LOCATION_SOURCE_ID = "my-location-source"
 private const val MY_LOCATION_LAYER_ID = "my-location-layer"
 private const val MY_LOCATION_IMAGE_ID = "my-location-icon"
@@ -225,6 +267,9 @@ fun MapScreen(
     // as a source reference (not re-added each refresh) so updating it is a cheap setGeoJson
     // call rather than removing/re-adding a whole layer every time the viewport changes.
     var heatmapSource by remember { mutableStateOf<GeoJsonSource?>(null) }
+    // The fine tier's source, added and repopulated on exactly the same terms as heatmapSource
+    // above — the two are one surface at two resolutions, cross-faded by zoom.
+    var fineHeatmapSource by remember { mutableStateOf<GeoJsonSource?>(null) }
     // Set once in onMapReady alongside heatmapSource, updated via setGeoJson whenever a fresh
     // GPS fix comes in — kept as its own source/layer rather than a Marker annotation because
     // refreshVisibleProperties() calls removeAnnotations() on every pan/zoom, which would wipe
@@ -274,49 +319,116 @@ fun MapScreen(
     // entirely, since individual house dots stop being meaningful at that scale anyway.
     // Never moves the camera itself: called after centring on GPS, after a search, and every
     // time the camera-idle listener fires because the user panned or zoomed.
-    // Turns per-sector sale counts (last 2 years) into normalized (0..1) heat weights, relative
-    // to whatever's currently loaded — the low/high end of the scale is always "quietest/busiest
-    // sector on screen right now", not a fixed nationwide scale, so it stays meaningful whether
-    // you're looking at central London or a small town, and updates as you pan elsewhere.
+    // The two heatmap tiers each turn sale counts into normalized (0..1) heat weights, but they
+    // cannot share a formula — their distributions are nothing alike. Across the country a
+    // sector holds 1..987 sales (mean 204); a single postcode holds 1..135 (mean 2.27, and the
+    // majority hold just one or two). A scale that reads well for one flattens the other.
     //
-    // Scaled between the 5th and 95th percentile rather than between the outright min and max,
-    // which are single sectors and behave like it. Nationwide the extremes are 1 sale and 987,
-    // so one outlier set the top of the scale and squashed the median sector (195 sales) down to
-    // a weight of 0.2; worse, both ends were a step function of whether that one sector happened
-    // to be on screen, so panning it in or out visibly rescaled the entire heatmap at once.
-    // Percentiles move smoothly as you pan and put the median sector near the middle of the
-    // range where it belongs.
+    // Both scale relative to what's currently loaded rather than to a fixed nationwide range, so
+    // the low/high end of the ramp is always "quietest/busiest thing on screen right now" and
+    // stays meaningful whether you're looking at central London or a small town.
     //
     // Building the FeatureCollection is done off the main thread (setGeoJson itself still has to
-    // happen on it): zoomed all the way out this is every sector in the country — ~8k points to
-    // allocate and serialise — which is enough to drop frames if it runs on the UI thread.
+    // happen on it): zoomed out the coarse tier is every sector in the country (~8k points), and
+    // the fine tier reaches ~11k over central London — enough allocation and serialisation to
+    // drop frames if it ran on the UI thread.
+    // Takes a lambda rather than a ready-made list so that the *whole* computation — the sort
+    // and percentile pick as well as the per-point weighting — runs off the main thread, not
+    // just the feature building. refreshVisibleProperties runs on the main dispatcher, and the
+    // fine tier sorts up to FINE_HEAT_MAX_POINTS entries.
+    suspend fun buildHeatFeatures(
+        points: () -> List<Pair<LatLng, Double>>
+    ): FeatureCollection = withContext(Dispatchers.Default) {
+        FeatureCollection.fromFeatures(
+            points().map { (position, weight) ->
+                Feature.fromGeometry(
+                    Point.fromLngLat(position.longitude, position.latitude),
+                    JsonObject().apply { addProperty("weight", weight) }
+                )
+            }
+        )
+    }
+
+    // Coarse tier. Scaled from the 5th percentile up to the outright maximum, through a square
+    // root.
+    //
+    // The floor is a percentile rather than the minimum because a single 1-sale sector otherwise
+    // anchors the bottom of the scale, and both ends then become a step function of whether that
+    // one sector happens to be on screen — panning it in or out visibly rescaled the whole
+    // surface at once.
+    //
+    // The ceiling used to be the 95th percentile for the same reason, but clipping there meant
+    // every sector in the top 5% rendered identically at full heat: over a Greater London view
+    // that pinned 61 of 1,196 sectors to 1.0, with the ceiling at 380 sales against a true
+    // maximum of 987. Which patch looked hottest was then decided by how tightly those 61 tied
+    // points happened to cluster — MapLibre sums overlapping kernels — rather than by sale
+    // count, so the busiest area in the country was not the reddest thing on screen.
+    //
+    // The square root is what makes scaling to the true maximum affordable. Linearly, that one
+    // outlier squashes the median London sector to 0.186 and the surface washes out — exactly
+    // what the p95 clip was introduced to prevent. sqrt lifts the mid-range back: measured over
+    // the same view it puts the median at 0.431 (against 0.485 under the old clip, so no visible
+    // washout), drops the former p95 sector from 1.0 to 0.619, and leaves the genuinely busiest
+    // sector as the only thing at full heat.
     suspend fun updateHeatmapSource(sectors: List<PostcodeSectorPrice>) {
         if (sectors.isEmpty()) {
             heatmapSource?.setGeoJson(FeatureCollection.fromFeatures(emptyArray()))
             return
         }
-        val collection = withContext(Dispatchers.Default) {
+        val collection = buildHeatFeatures {
             val sorted = sectors.map { it.saleCount }.sorted()
             val low = sorted[(sorted.size - 1) * 5 / 100]
-            val high = sorted[(sorted.size - 1) * 95 / 100]
+            val high = sorted.last()
             val range = (high - low).toDouble()
-            val features = sectors.map { sector ->
+            sectors.map { sector ->
                 // range == 0 means every sector in view is equally busy (or there's only one),
                 // in which case there's no contrast to show and a flat full weight is the honest
                 // rendering — normalizing would divide by zero or wash the lot out to nothing.
                 val weight =
                     if (range <= 0.0) 1.0
-                    else ((sector.saleCount - low) / range).coerceIn(0.0, 1.0)
-                val properties = JsonObject().apply { addProperty("weight", weight) }
-                Feature.fromGeometry(Point.fromLngLat(sector.longitude, sector.latitude), properties)
+                    else sqrt(((sector.saleCount - low) / range).coerceIn(0.0, 1.0))
+                LatLng(sector.latitude, sector.longitude) to weight
             }
-            FeatureCollection.fromFeatures(features)
         }
         // Deliberately read after the suspension above, not before it: a dark-mode toggle
         // replaces the whole Style mid-refresh, and the GeoJsonSource this held a moment ago
         // would by then be orphaned from a destroyed style. onStyleLoaded repopulates the fresh
         // one itself, so dropping this update is the correct outcome, not a lost frame.
         heatmapSource?.setGeoJson(collection)
+    }
+
+    // Fine tier. Scaled from *zero* up to the 95th percentile — the one place these two
+    // functions deliberately disagree.
+    //
+    // Subtracting a low percentile the way the coarse tier does would be actively wrong here.
+    // Per-postcode counts run 1..135 with a mean of 2.27, so the 5th percentile is 1 — and
+    // subtracting it would assign weight 0 to every postcode with a single sale, which is most
+    // of them. The cool background would vanish and only the handful of busy blocks would render,
+    // turning a density surface into scattered dots. Starting at zero keeps one sale meaningfully
+    // warm and lets the density come from kernel accumulation across neighbouring postcodes,
+    // which is precisely the "busy where lots has sold" signal wanted.
+    //
+    // The ceiling is a percentile, not the maximum, because the fine tier's outliers are extreme
+    // relative to its median: one large block of flats transacting can hold 100+ sales against a
+    // typical postcode's 2, and scaling to that would flatten every ordinary street to nothing.
+    // Clipping the top few percent costs little here — unlike the coarse tier, the visible peak
+    // is carried by how many warm postcodes overlap, not by any single point reaching 1.0.
+    suspend fun updateFineHeatmapSource(postcodes: List<PostcodeDensity>) {
+        if (postcodes.isEmpty()) {
+            fineHeatmapSource?.setGeoJson(FeatureCollection.fromFeatures(emptyArray()))
+            return
+        }
+        val collection = buildHeatFeatures {
+            val sorted = postcodes.map { it.saleCount }.sorted()
+            // coerceAtLeast(1) guards the divide: a view where every postcode has one sale gives
+            // a p95 of 1, and everything there is equally busy anyway.
+            val high = sorted[(sorted.size - 1) * 95 / 100].coerceAtLeast(1).toDouble()
+            postcodes.map { postcode ->
+                val weight = (postcode.saleCount / high).coerceIn(0.0, 1.0)
+                LatLng(postcode.latitude, postcode.longitude) to weight
+            }
+        }
+        fineHeatmapSource?.setGeoJson(collection)
     }
 
     // Empty position clears the pin (permission denied, or a fix that never resolved) rather
@@ -346,15 +458,28 @@ fun MapScreen(
         val minLng = bounds.longitudeWest - lngBuffer
         val maxLng = bounds.longitudeEast + lngBuffer
 
-        // Updated before the zoom gate below rather than after it: unlike the dots, a density
-        // surface is *most* useful zoomed out, and it now costs effectively nothing at any zoom
-        // — it's an in-memory filter over a precomputed table (see
+        // Both tiers are updated before the dots' zoom gate below rather than after it: unlike
+        // the dots, a density surface is *most* useful zoomed out.
+        //
+        // The coarse tier stays unconditional because it costs effectively nothing at any zoom —
+        // it's an in-memory filter over a precomputed table (see
         // PropertyRepository.salesDensityBySector), not the viewport-wide GROUP BY it used to
-        // be. That query is why this used to need a zoom floor of its own; without it there's
-        // nothing left to gate on.
+        // be. That query is why it used to need a zoom floor of its own.
+        //
+        // The fine tier is gated, because it is a real bounds query and its cost scales with the
+        // area on screen — the very thing the precomputed rollup exists to avoid. Below
+        // MIN_ZOOM_FOR_FINE_HEAT it's cleared rather than skipped: its layer has already faded
+        // out by then, but leaving a stale collection in the source would keep MapLibre holding
+        // (and, on the way back in, briefly drawing) points for wherever the camera used to be.
+        val heatEnabled = currentSettings.heatmapEnabled
         updateHeatmapSource(
-            if (currentSettings.heatmapEnabled) {
-                repo.salesDensityBySector(minLat, maxLat, minLng, maxLng)
+            if (heatEnabled) repo.salesDensityBySector(minLat, maxLat, minLng, maxLng) else emptyList()
+        )
+        updateFineHeatmapSource(
+            if (heatEnabled && zoom >= MIN_ZOOM_FOR_FINE_HEAT) {
+                repo.postcodeDensityWithinBounds(
+                    minLat, maxLat, minLng, maxLng, limit = FINE_HEAT_MAX_POINTS
+                )
             } else {
                 emptyList()
             }
@@ -651,6 +776,31 @@ fun MapScreen(
             // GeoJsonSource starts out empty — from whatever data is already known, rather than
             // waiting for the next pan/zoom or GPS fix to fill them back in.
             onStyleLoaded = { _, style ->
+                // Shared by both tiers — the surface should read identically whichever one is
+                // drawing it, so this is defined once rather than restated per layer.
+                //
+                // Stops bunched towards the bottom rather than spread evenly, because the
+                // accumulated density is: across one view the quiet edges and the busiest core
+                // differ by ~50x, so evenly spaced stops spend most of the ramp on values almost
+                // nothing has, showing a hot core over a uniformly blank surround. Roughly
+                // logarithmic spacing gives the sparse end somewhere to land, which is what makes
+                // a town read as a town rather than as empty map.
+                //
+                // Still feathers in from fully transparent well before the first colour stop, so
+                // a blob's edge fades out gradually instead of an abrupt transparent-to-blue
+                // boundary — that's what lets adjacent points' blobs blend rather than looking
+                // like separate circles butted up against each other.
+                val heatColorRamp = Expression.interpolate(
+                    Expression.linear(), Expression.heatmapDensity(),
+                    Expression.stop(0, "rgba(0,0,0,0)"),
+                    Expression.stop(0.015, "rgba(33,102,172,0.12)"),
+                    Expression.stop(0.05, "rgba(33,102,172,0.35)"),
+                    Expression.stop(0.12, "rgba(103,169,207,0.55)"),
+                    Expression.stop(0.25, "rgba(253,219,199,0.65)"),
+                    Expression.stop(0.5, "rgba(239,138,98,0.8)"),
+                    Expression.stop(1, "rgba(178,24,43,0.92)")
+                )
+
                 val source = GeoJsonSource(HEATMAP_SOURCE_ID)
                 style.addSource(source)
                 heatmapSource = source
@@ -664,7 +814,7 @@ fun MapScreen(
                             // what stops the country turning into a single red blob when zoomed
                             // out. MapLibre *accumulates* every point's kernel: the density at a
                             // pixel is the sum of (weight x intensity x gaussian) over every
-                            // sector within a radius of it, and the colour ramp below is sampled
+                            // sector within a radius of it, and the colour ramp above is sampled
                             // at min(density, 1) — so once enough kernels overlap, everything is
                             // pinned to the top of the ramp and all contrast is gone.
                             //
@@ -686,6 +836,10 @@ fun MapScreen(
                             // cool country rather than the whole map reading as one hot spot.
                             // These are eyeballed as well as computed; if the surface ever looks
                             // washed out or blown out again, this pair is the place to adjust.
+                            //
+                            // Only the stops up to FINE_HEAT_FULL_ZOOM matter now — this layer is
+                            // fully faded out above it — but the upper ones are kept so the curve
+                            // doesn't extrapolate oddly across the fade itself.
                             PropertyFactory.heatmapIntensity(
                                 Expression.interpolate(
                                     Expression.linear(), Expression.zoom(),
@@ -711,37 +865,91 @@ fun MapScreen(
                                     Expression.stop(16, 220f)
                                 )
                             ),
-                            // Subtle: lower ceiling than a typical heatmap (0.7), so it reads as
-                            // a tint over the map rather than obscuring it. Slightly higher than
-                            // it was only because it no longer sits on top of a surface that was
-                            // saturated everywhere — the same value now looks fainter.
-                            PropertyFactory.heatmapOpacity(0.55f),
-                            PropertyFactory.heatmapColor(
+                            // Hands over to the fine tier across MIN_ZOOM_FOR_FINE_HEAT ->
+                            // FINE_HEAT_FULL_ZOOM. A cross-fade rather than a hard switch because
+                            // the two tiers render visibly different surfaces at the boundary —
+                            // swapping them in one frame reads as the map glitching, whereas
+                            // fading reads as detail resolving.
+                            PropertyFactory.heatmapOpacity(
                                 Expression.interpolate(
-                                    Expression.linear(), Expression.heatmapDensity(),
-                                    // Stops bunched towards the bottom rather than spread evenly,
-                                    // because the accumulated density is: across one view the
-                                    // quiet edges and the busiest core differ by ~50x, so evenly
-                                    // spaced stops spend most of the ramp on values almost
-                                    // nothing has, showing a hot core over a uniformly blank
-                                    // surround. Roughly logarithmic spacing gives the sparse end
-                                    // somewhere to land, which is what makes a town read as a
-                                    // town rather than as empty map.
-                                    //
-                                    // Still feathers in from fully transparent well before the
-                                    // first colour stop, so a blob's edge fades out gradually
-                                    // instead of an abrupt transparent-to-blue boundary — that's
-                                    // what lets adjacent sectors' blobs blend rather than looking
-                                    // like separate circles butted up against each other.
-                                    Expression.stop(0, "rgba(0,0,0,0)"),
-                                    Expression.stop(0.015, "rgba(33,102,172,0.12)"),
-                                    Expression.stop(0.05, "rgba(33,102,172,0.35)"),
-                                    Expression.stop(0.12, "rgba(103,169,207,0.55)"),
-                                    Expression.stop(0.25, "rgba(253,219,199,0.65)"),
-                                    Expression.stop(0.5, "rgba(239,138,98,0.8)"),
-                                    Expression.stop(1, "rgba(178,24,43,0.92)")
+                                    Expression.linear(), Expression.zoom(),
+                                    Expression.stop(MIN_ZOOM_FOR_FINE_HEAT, HEATMAP_MAX_OPACITY),
+                                    Expression.stop(FINE_HEAT_FULL_ZOOM, 0f)
                                 )
-                            )
+                            ),
+                            PropertyFactory.heatmapColor(heatColorRamp)
+                        )
+                    }
+                )
+
+                val fineSource = GeoJsonSource(FINE_HEATMAP_SOURCE_ID)
+                style.addSource(fineSource)
+                fineHeatmapSource = fineSource
+                // Added after the coarse layer so it draws on top through the cross-fade; with
+                // the order reversed the outgoing sector blobs would sit over the incoming
+                // detail and the handover would look like a smear rather than a sharpening.
+                style.addLayer(
+                    HeatmapLayer(FINE_HEATMAP_LAYER_ID, FINE_HEATMAP_SOURCE_ID).apply {
+                        setProperties(
+                            PropertyFactory.heatmapWeight(Expression.get("weight")),
+                            // Its own radius/intensity curves, not the coarse tier's. The
+                            // accumulation arithmetic described above cuts both ways: those
+                            // values are tuned for a few hundred sparse sector points, and this
+                            // tier puts ~5k tightly packed postcodes on screen at zoom 14 over
+                            // central London — roughly 90m, about 30px, apart. So the radius
+                            // tracks the actual point spacing rather than a sector's footprint,
+                            // and the intensity has to fall to match the far greater overlap.
+                            //
+                            // Both curves are solved rather than guessed, by simulating the
+                            // shader's own accumulation
+                            // (sum of weight x intensity x 0.3989 x exp(-4.5 (d/r)^2), sampled at
+                            // min(density, 1)) over the real postcode_stats table. The radius
+                            // stops were set to the measured point spacing, then the intensity at
+                            // each was solved to put the 99.9th-percentile pixel of a central
+                            // London view — the densest in the country — exactly at the top of
+                            // the ramp. That leaves 0.1% of screen fully saturated and 0.6-3.6%
+                            // warm at every zoom, against the coarse tier's <3% ceiling, with
+                            // 33-68% carrying visible tint so it still reads as a surface.
+                            //
+                            // Calibrating on the densest view is what makes the tier honest
+                            // across the country: the same curve peaks at 1.8 over London, 0.8-1.5
+                            // over Ipswich and 0.4-0.9 over Oxford, so London is the only place
+                            // that fully saturates — which is true of the data.
+                            //
+                            // A first pass at these was ~5x too low, which simulated out at a peak
+                            // density of 0.26-0.37: the busiest street in the country would have
+                            // rendered pale peach and nothing would ever have gone red. If the
+                            // surface ever looks washed out or blown out, re-run that simulation
+                            // rather than nudging by eye — the two failure modes look similar on
+                            // screen and only the arithmetic separates them.
+                            PropertyFactory.heatmapIntensity(
+                                Expression.interpolate(
+                                    Expression.linear(), Expression.zoom(),
+                                    Expression.stop(MIN_ZOOM_FOR_FINE_HEAT, 0.70f),
+                                    Expression.stop(14, 0.65f), Expression.stop(15, 1.3f),
+                                    Expression.stop(16, 2.25f), Expression.stop(17, 2.45f),
+                                    Expression.stop(18, 2.9f)
+                                )
+                            ),
+                            PropertyFactory.heatmapRadius(
+                                Expression.interpolate(
+                                    Expression.linear(), Expression.zoom(),
+                                    Expression.stop(MIN_ZOOM_FOR_FINE_HEAT, 26f),
+                                    Expression.stop(14, 34f), Expression.stop(15, 55f),
+                                    Expression.stop(16, 80f), Expression.stop(18, 150f)
+                                )
+                            ),
+                            // The mirror of the coarse layer's fade, so the pair sums to a
+                            // roughly constant tint across the handover instead of dipping or
+                            // doubling in the middle of it.
+                            PropertyFactory.heatmapOpacity(
+                                Expression.interpolate(
+                                    Expression.linear(), Expression.zoom(),
+                                    Expression.stop(MIN_ZOOM_FOR_FINE_HEAT, 0f),
+                                    Expression.stop(FINE_HEAT_FULL_ZOOM, HEATMAP_MAX_OPACITY)
+                                )
+                            ),
+                            PropertyFactory.heatmapColor(heatColorRamp)
                         )
                     }
                 )

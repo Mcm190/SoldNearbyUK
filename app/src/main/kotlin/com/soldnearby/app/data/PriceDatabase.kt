@@ -174,8 +174,10 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
     }
 
     /**
-     * Every postcode sector's precomputed 2-year rollup — the data behind the recent-sales
-     * heatmap (which weights by sale count, not price; see PropertyRepository). Read once and
+     * Every postcode sector's precomputed 2-year rollup — the *coarse* tier of the recent-sales
+     * heatmap (which weights by sale count, not price; see PropertyRepository), used for zoomed-
+     * out views. [postcodesWithinBounds] takes over once the camera is close enough in that one
+     * point per sector stops resolving anything. Read once and
      * held in memory: the whole sector_stats table is ~8k rows / a few hundred KB no matter how
      * large sold_properties itself gets, so there's nothing a bounds query would save.
      *
@@ -203,6 +205,55 @@ class PriceDatabase private constructor(private val db: SQLiteDatabase) {
     ): List<PostcodeSectorPrice> = sectorStats.filter {
         it.latitude >= minLat && it.latitude <= maxLat &&
             it.longitude >= minLng && it.longitude <= maxLng
+    }
+
+    /**
+     * Per-postcode sale counts whose point falls inside the given bounds — the heatmap's fine
+     * tier, for zoomed-in views where [sectorsWithinBounds] can't resolve anything useful.
+     *
+     * A real query, unlike [sectorsWithinBounds]. postcode_stats holds ~749k rows against
+     * sector_stats' 8.3k, far too much to hold in memory, so this leans on
+     * idx_postcode_stats_lat_lng to make it an index range scan over the visible latitude band
+     * instead of the full-table scan that made the old live rollup unusable. That's affordable
+     * here only because the caller gates it on zoom: measured against this dataset, a padded
+     * viewport over central London — the densest in the country — holds ~11k postcodes at zoom
+     * 13.5 and ~5.7k at zoom 14, against ~34k at zoom 12.5. Calling this zoomed out would put
+     * back exactly the cost the precomputed rollup exists to remove.
+     *
+     * No per-cell cap and no grid, unlike [findInBounds]: that grid exists to spread a *sample*
+     * of dots evenly across the viewport, whereas the heatmap wants every point it can get —
+     * dropping any would understate the density it's there to show. [limit] is a defensive
+     * bound on memory rather than a shaping choice, and at the measured worst case it never
+     * binds.
+     */
+    fun postcodesWithinBounds(
+        minLat: Double,
+        maxLat: Double,
+        minLng: Double,
+        maxLng: Double,
+        limit: Int
+    ): List<PostcodeDensity> {
+        val sql = """
+            SELECT postcode, sale_count, latitude, longitude
+            FROM postcode_stats
+            WHERE latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?
+            LIMIT ?
+        """.trimIndent()
+        val args = arrayOf(
+            minLat.toString(), maxLat.toString(), minLng.toString(), maxLng.toString(), limit.toString()
+        )
+        val results = mutableListOf<PostcodeDensity>()
+        db.rawQuery(sql, args).use { cursor ->
+            while (cursor.moveToNext()) {
+                results += PostcodeDensity(
+                    postcode = cursor.getString(0),
+                    saleCount = cursor.getInt(1),
+                    latitude = cursor.getDouble(2),
+                    longitude = cursor.getDouble(3)
+                )
+            }
+        }
+        return results
     }
 
     private fun loadSectorStats(): List<PostcodeSectorPrice> {

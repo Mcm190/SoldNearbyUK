@@ -48,6 +48,7 @@ Find the current one at https://www.arcgis.com/sharing/rest/search?q=ONS%20Postc
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import datetime
 import sqlite3
@@ -68,12 +69,15 @@ INSERT_BATCH_SIZE = 50_000
 # transactions in place; an install that already had a copy would then keep using its old,
 # structurally-outdated one and blow up on the first query that touches whatever was added.
 # See PriceDatabase.open().
-SEED_SCHEMA_VERSION = 2
+SEED_SCHEMA_VERSION = 3
 
-# How far back sector_stats aggregates, in years. Anchored to the newest sale actually in the
-# dataset rather than to today's date, for the same reason PropertyRepository is: the bundled
-# data doesn't necessarily reach up to today, so a "today minus 2 years" cutoff could exclude
-# everything. Kept in step with the window PropertyRepository.salesDensityBySector documents.
+# How far back both heatmap rollups (sector_stats and postcode_stats) aggregate, in years.
+# Anchored to the newest sale actually in the dataset rather than to today's date, for the same
+# reason PropertyRepository is: the bundled data doesn't necessarily reach up to today, so a
+# "today minus 2 years" cutoff could exclude everything. Kept in step with the window
+# PropertyRepository.salesDensityBySector documents. The two rollups MUST share one cutoff —
+# they are two resolutions of the same surface, and the app cross-fades between them, so a
+# mismatch would make the heatmap visibly change meaning partway through a zoom.
 SECTOR_STATS_YEARS = 2
 
 INSERT_SQL = """
@@ -204,8 +208,74 @@ def create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def build_sector_stats(conn: sqlite3.Connection) -> int:
-    """Precomputes the per-postcode-sector rollup behind the app's heatmap.
+def rollup_cutoff(conn: sqlite3.Connection) -> str:
+    """The shared start date for both heatmap rollups: SECTOR_STATS_YEARS before the newest
+    sale actually in the dataset.
+
+    The day is clamped to the target month's length rather than carried over verbatim.
+    `date.replace(year=...)` raises ValueError("day is out of range for month") when the
+    newest sale falls on 29 February and the year it lands in isn't a leap year — which would
+    abort the build at its very last step, after the multi-hour ingest has already run.
+    """
+    max_date = datetime.date.fromisoformat(
+        conn.execute("SELECT MAX(date_of_transfer) FROM sold_properties").fetchone()[0]
+    )
+    year = max_date.year - SECTOR_STATS_YEARS
+    day = min(max_date.day, calendar.monthrange(year, max_date.month)[1])
+    return datetime.date(year, max_date.month, day).isoformat()
+
+
+def build_postcode_stats(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Precomputes the per-postcode rollup — the *fine* tier of the app's heatmap.
+
+    sector_stats alone can't describe a zoomed-in view. It carries one point per postcode
+    sector, placed at the mean of that sector's sale coordinates, and measured against this
+    dataset a zoom-16 view (1.2 x 2.2 km) contains 3 such points over Ipswich and 30 over
+    central London — while the points themselves sit a mean 254-395m, and up to 1.6km, away
+    from the sales they stand for. Three Gaussian blobs at averaged positions can't say
+    anything useful about which street is busy, so zoomed in the heat visibly failed to line
+    up with the dots underneath it. This table is what the app switches to above
+    MIN_ZOOM_FOR_FINE_HEAT; sector_stats still serves everything below.
+
+    MIN(latitude), MIN(longitude) rather than AVG: ONSPD gives exactly one coordinate per
+    postcode, verified against this dataset (zero postcodes in the window carry more than one
+    distinct coordinate), so MIN is exact *and* guarantees each heat point lands on precisely
+    the coordinate the map draws that postcode's dot at. AVG would be arithmetically identical
+    today but would silently start drifting off the dots if that ever stopped holding.
+
+    ~749k rows against sector_stats' 8.3k, so unlike sector_stats the app cannot hold this in
+    memory — hence the lat/lng index, which is what makes the app's bounds query an index range
+    scan rather than the full-table scan that made the old live rollup unusable.
+    """
+    conn.execute(
+        """
+        CREATE TABLE postcode_stats (
+            postcode TEXT PRIMARY KEY,
+            sale_count INTEGER NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO postcode_stats (postcode, sale_count, latitude, longitude)
+        SELECT postcode, COUNT(*), MIN(latitude), MIN(longitude)
+        FROM sold_properties
+        WHERE date_of_transfer >= ?
+        GROUP BY postcode
+        """,
+        (cutoff,),
+    )
+    conn.execute("CREATE INDEX idx_postcode_stats_lat_lng ON postcode_stats (latitude, longitude)")
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM postcode_stats").fetchone()[0]
+    print(f"  {count:,} postcodes, aggregated over sales since {cutoff}.", file=sys.stderr)
+    return count
+
+
+def build_sector_stats(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Precomputes the per-postcode-sector rollup — the *coarse* tier of the app's heatmap.
 
     The app used to derive this live, running the GROUP BY below over whatever was in the
     viewport on every single camera-idle event. That's fine at street level, but the cost
@@ -222,18 +292,15 @@ def build_sector_stats(conn: sqlite3.Connection) -> int:
     app's "recent sales only" setting by design, and the app weights purely on sale_count — so
     the entire query exists to re-derive constants. Precomputing it collapses the whole thing
     to ~8k rows (a few hundred KB), small enough that the app loads the table into memory once
-    and filters it there, never touching SQLite for the heatmap again at any zoom level.
+    and filters it there rather than querying for it. (The fine tier, postcode_stats, is far
+    too big for that and is queried by bounds — but only above MIN_ZOOM_FOR_FINE_HEAT, where
+    the viewport is small enough for an index range scan to be cheap.)
 
     One deliberate behaviour change: a sector's count is now its true total, whereas the live
     query only counted the rows inside the viewport, so a sector straddling the edge of the
     screen used to report a partial count and a centroid dragged toward the visible part —
     both of which shifted as you panned.
     """
-    max_date = conn.execute("SELECT MAX(date_of_transfer) FROM sold_properties").fetchone()[0]
-    cutoff = datetime.date.fromisoformat(max_date).replace(
-        year=datetime.date.fromisoformat(max_date).year - SECTOR_STATS_YEARS
-    ).isoformat()
-
     conn.execute(
         """
         CREATE TABLE sector_stats (
@@ -377,8 +444,12 @@ def main() -> None:
     conn.execute("CREATE INDEX idx_sold_properties_address ON sold_properties (postcode, address)")
     conn.commit()
 
-    print("Building postcode-sector rollup...", file=sys.stderr)
-    build_sector_stats(conn)
+    # Both heatmap tiers, off one shared cutoff — see rollup_cutoff and SECTOR_STATS_YEARS.
+    cutoff = rollup_cutoff(conn)
+    print("Building postcode-sector rollup (coarse heatmap tier)...", file=sys.stderr)
+    build_sector_stats(conn, cutoff)
+    print("Building per-postcode rollup (fine heatmap tier)...", file=sys.stderr)
+    build_postcode_stats(conn, cutoff)
     conn.close()
 
     # A small sidecar the app reads to detect "the bundled asset changed" without having to

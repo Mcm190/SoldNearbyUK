@@ -338,24 +338,48 @@ recoverable through Play Console's key-reset process rather than fatal.
   500 per view (`PriceDatabase.findInBounds`'s `limit`), raised from an
   earlier, more conservative 200 once completeness (every sold property
   visible, not just a sampled subset) became the priority over raw marker
-  count. The optional recent-sales heatmap is a second, independent
-  MapLibre layer (`HeatmapLayer` + `GeoJsonSource`, added once in
-  `onMapReady` and updated in place via `setGeoJson` rather than
-  removed/re-added every refresh) fed by
-  `PropertyRepository.salesDensityBySector` — one point per postcode
-  sector at its average lat/lng, weighted by that sector's sale count
-  over the last 2 years, normalized 0..1 *against whatever else is
-  currently loaded* (see `updateHeatmapSource` in `MapScreen.kt`), which
-  is what makes "redder = more sales" mean something as you pan to a
-  quieter or busier area rather than washing out against a fixed
-  nationwide scale. That 2-year window is fixed and independent of the
-  "recent sales only" dot filter — one is a heatmap-only concept of
-  "recent", the other controls which dots are shown at all. It has no
-  zoom floor of its own (sector aggregates are a cheap SQL `GROUP BY`,
-  not a per-row fetch), so it's useful precisely where dots aren't shown
-  yet — the `SettingsScreen.kt` toggle (`AppSettings.heatmapEnabled`)
-  turns it on/off; off, the source is just cleared to empty rather than
-  the layer being removed.
+  count. The optional recent-sales heatmap is **two** independent MapLibre
+  layers (`HeatmapLayer` + `GeoJsonSource` each, added once per style load
+  and updated in place via `setGeoJson` rather than removed/re-added every
+  refresh) — one surface at two resolutions, cross-faded by zoom across
+  `MIN_ZOOM_FOR_FINE_HEAT`..`FINE_HEAT_FULL_ZOOM` (13.5..14).
+  The **coarse** tier (`PropertyRepository.salesDensityBySector`) is one
+  point per postcode sector at its average lat/lng; the **fine** tier
+  (`postcodeDensityWithinBounds`) is one point per full postcode, at the
+  exact coordinate that postcode's dots are drawn at. Both are weighted by
+  sale count over the last 2 years, normalized 0..1 *against whatever else
+  is currently loaded*, which is what makes "redder = more sales" mean
+  something as you pan to a quieter or busier area rather than washing out
+  against a fixed nationwide scale.
+  The fine tier exists because one point per sector simply runs out of
+  resolution: a zoom-16 view holds 3 sector centroids over Ipswich and 30
+  over central London, and each sits at the mean of its sector's sale
+  coordinates — a mean 254-395m, and up to 1.6km, from the sales it stands
+  for. Zoomed in, the heat visibly failed to sit over the dots underneath
+  it. It's gated on zoom because unlike the coarse tier it's a real bounds
+  query whose cost scales with the area on screen (~11k postcodes at 13.5
+  over central London, but ~34k at 12.5).
+  The two tiers normalize differently on purpose — see `updateHeatmapSource`
+  / `updateFineHeatmapSource` in `MapScreen.kt`. A sector holds 1..987 sales
+  (mean 204) and is scaled `sqrt(p05..max)`; a postcode holds 1..135 (mean
+  2.27, mostly 1-2) and is scaled `0..p95`, because subtracting a low
+  percentile there would zero out the majority of points and delete the
+  cool background entirely. The coarse tier's ceiling used to be the 95th
+  percentile, which pinned 418 sectors nationwide (61 of 1,196 in a London
+  view) to identical full heat, so the busiest area in the country was not
+  the reddest thing on screen; the square root is what makes scaling to the
+  true maximum affordable without the surface washing out.
+  Each tier also has its own radius/intensity curves, solved by simulating
+  the shader's accumulation against the real rollup tables rather than set
+  by eye — the fine tier packs far more points per pixel, so reusing the
+  coarse tier's values would saturate it instantly.
+  That 2-year window is fixed and independent of the "recent sales only"
+  dot filter — one is a heatmap-only concept of "recent", the other
+  controls which dots are shown at all. The coarse tier has no zoom floor,
+  so the heatmap is useful precisely where dots aren't shown yet — the
+  `SettingsScreen.kt` toggle (`AppSettings.heatmapEnabled`) turns it
+  on/off; off, both sources are cleared to empty rather than the layers
+  being removed.
 - **Data**: `data/PriceDatabase.kt` reads the bundled SQLite file directly
   (plain `SQLiteDatabase`, not Room — the file is built externally by the
   Python script, so there's no Room schema-hash to keep in sync with it).
@@ -382,7 +406,7 @@ recoverable through Play Console's key-reset process rather than fatal.
   recency filter (history is specifically about the past); it relies on
   the pre-built `idx_sold_properties_address` index — the alternative was
   a full scan of the whole table on every tap. `sectorsWithinBounds`
-  backs the recent-sales heatmap via `PropertyRepository.salesDensityBySector`
+  backs the heatmap's coarse tier via `PropertyRepository.salesDensityBySector`
   (which weights by sale count, not price). It isn't a query: the
   per-sector rollup is precomputed into a `sector_stats` table by
   `build_seed_data.py` and read into memory once, because nothing about
@@ -392,6 +416,17 @@ recoverable through Play Console's key-reset process rather than fatal.
   when zoomed out, and blocked every other query behind it (the file is
   opened read-only and non-WAL, so Android caps its connection pool at
   one). The whole table is ~8k rows regardless of dataset size.
+  `postcodesWithinBounds` backs the fine tier from the `postcode_stats`
+  table built alongside it — ~749k rows, far too many to hold in memory,
+  so this one *is* a query, leaning on a pre-built lat/lng index and gated
+  on zoom by the caller so it only ever runs over a small viewport.
+  Both rollups share one cutoff (`rollup_cutoff`), and
+  `tools/backfill_heatmap_rollups.py` rebuilds them in place against an
+  already-ingested database — they're pure `INSERT ... SELECT` over
+  `sold_properties`, so a rollup change doesn't need the multi-hour
+  nationwide re-ingest. It cross-checks that both tiers sum to the same
+  total, which is what catches sales being lost or double-counted between
+  the two resolutions.
   `data/PropertyRepository.kt` is the seam to swap for a network-backed
   implementation later; the UI only depends on its shape.
   `data/AppSettings.kt` + `SettingsRepository` persist the recency-filter

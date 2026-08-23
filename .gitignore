@@ -25,3 +25,6 @@ tools/.bundletool-all.jar
 
 # Scratch workspace used to build sideloadable release APKs — not part of the project.
 /sideload_build/
+
+# Python bytecode from tools/ (backfill_heatmap_rollups.py imports build_seed_data).
+__pycache__/

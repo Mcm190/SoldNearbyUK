@@ -75,9 +75,12 @@ fun SettingsScreen(
                 Column(Modifier.weight(1f)) {
                     Text("Recent sales heatmap", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Shows how many homes have sold nearby in the last 2 years, by postcode " +
-                            "sector, as a translucent overlay. Red means more sales in that area; " +
-                            "blue means fewer.",
+                        "Shows how many sales there have been nearby, as a translucent overlay. " +
+                            "Red means more sales in that area; blue means fewer. Always covers " +
+                            "the last 2 years, whatever \"Recent sales only\" is set to.\n\n" +
+                            "It counts sales, not properties, so it won't simply match the dots: " +
+                            "every flat in a block shares one postcode and so draws a single dot, " +
+                            "but each of its sales still counts towards the colour.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
