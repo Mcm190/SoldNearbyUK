@@ -24,8 +24,8 @@ android {
         applicationId = "com.soldnearby.app"
         minSdk = 26
         targetSdk = 37
-        versionCode = 9
-        versionName = "0.1.8"
+        versionCode = 10
+        versionName = "0.1.9"
     }
 
     // seed_prices.db lives in the :seed_data install-time asset pack, not app/src/main/assets —
