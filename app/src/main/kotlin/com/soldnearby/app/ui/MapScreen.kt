@@ -1080,6 +1080,26 @@ fun MapScreen(
                     }
                 }
             }
+
+            // Ambient guidance, not a modal state: a small pill tucked under the search bar
+            // rather than a panel in the middle of the map, so it never covers the area the
+            // user is trying to look at while they zoom.
+            if (hasLoadedOnce && !isLoading && isZoomedOutTooFar) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.CenterHorizontally)
+                        .padding(top = 8.dp),
+                    shape = RoundedCornerShape(50),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                ) {
+                    Text(
+                        text = "Zoom in to see sold prices",
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+                    )
+                }
+            }
         }
 
         if (repository == null) {
@@ -1106,19 +1126,9 @@ fun MapScreen(
         }
 
         if (hasLoadedOnce && !isLoading) {
-            if (isZoomedOutTooFar) {
-                Surface(
-                    modifier = Modifier.align(Alignment.Center).padding(24.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
-                    contentColor = MaterialTheme.colorScheme.onSurface
-                ) {
-                    Text(
-                        text = "Zoom in to see sold prices",
-                        modifier = Modifier.padding(16.dp),
-                        textAlign = TextAlign.Center
-                    )
-                }
-            } else if (nearbyProperties.isEmpty()) {
+            // The zoom hint itself now lives under the search bar (see the top Column above);
+            // this centre slot is only for the "nothing here" case.
+            if (!isZoomedOutTooFar && nearbyProperties.isEmpty()) {
                 Surface(
                     modifier = Modifier.align(Alignment.Center).padding(24.dp),
                     color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
